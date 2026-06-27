@@ -89,9 +89,8 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
 }
 
 
-@st.cache_data(show_spinner=False)
 def default_watchlist() -> str:
-    """Read the repository watchlist. It is a starting point, not a permanent app database."""
+    """Read the latest default watchlist from the deployed repository."""
     path = scanner.DEFAULT_WATCHLIST
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
@@ -235,6 +234,10 @@ if "watchlist_text" not in st.session_state:
     st.session_state.watchlist_text = default_watchlist()
 
 with st.expander("Watchlist and scan settings", expanded=False):
+    if st.button("Reload saved watchlist from GitHub"):
+        st.session_state.watchlist_text = default_watchlist()
+        st.rerun()
+
     st.text_area(
         "Watchlist",
         key="watchlist_text",
