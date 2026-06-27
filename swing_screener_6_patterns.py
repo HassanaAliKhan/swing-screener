@@ -43,6 +43,24 @@ warnings.filterwarnings(
     category=DeprecationWarning,
 )
 
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r"^yfinance(\..*)?$",
+)
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"^yfinance(\..*)?$",
+)
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"^yfinance(\..*)?$",
+)
+
 import numpy as np
 import pandas as pd
 
