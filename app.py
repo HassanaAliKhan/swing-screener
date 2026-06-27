@@ -269,7 +269,7 @@ with st.expander("Watchlist and scan settings", expanded=False):
             step=0.5,
         )
     with controls_3:
-        include_prepost = st.checkbox("Include premarket / after-hours", value=False)
+        include_prepost = st.checkbox("Include premarket / after-hours", value=True)
 
     # Let the user tune two visible, high-impact gates without exposing every internal option.
     baseline = PROFILE_SETTINGS[profile]
@@ -298,7 +298,7 @@ with st.expander("Watchlist and scan settings", expanded=False):
             help="Use 1–2 if Yahoo temporarily returns errors. Higher is faster but can be less reliable.",
         )
 
-    show_debug = st.checkbox("Show classifications and data errors after scan", value=False)
+    show_debug = st.checkbox("Show classifications and data errors after scan", value=True)
 
 tickers = parse_watchlist(st.session_state.watchlist_text)
 status_left, status_right = st.columns([3, 1])
