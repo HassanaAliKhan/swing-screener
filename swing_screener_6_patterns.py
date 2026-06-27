@@ -411,8 +411,14 @@ def fetch_hourly(
             raw = _download_once(ticker, period, interval, include_prepost)
             if raw is not None and not raw.empty:
                 data = normalize_columns(raw, ticker)
+
+                # Yahoo can append zero-volume after-hours / placeholder candles.
+                # Remove them before calculating indicators and relative volume.
+                data = data.loc[data["Volume"].fillna(0).gt(0)].copy()
+                
+                # Ignore the newest valid candle because it may still be forming.
                 if len(data) > 1:
-                    data = data.iloc[:-1].copy()  # exclude newest possibly-open candle
+                    data = data.iloc[:-1].copy()
                 if len(data) >= min_completed_bars:
                     return ticker, data, None
                 attempts.append(
@@ -430,6 +436,12 @@ def fetch_hourly(
             raw = _history_fallback(ticker, period, interval, include_prepost)
             if raw is not None and not raw.empty:
                 data = normalize_columns(raw, ticker)
+
+                # Yahoo can append zero-volume after-hours / placeholder candles.
+                # Remove them before calculating indicators and relative volume.
+                data = data.loc[data["Volume"].fillna(0).gt(0)].copy()
+                
+                # Ignore the newest valid candle because it may still be forming.
                 if len(data) > 1:
                     data = data.iloc[:-1].copy()
                 if len(data) >= min_completed_bars:
