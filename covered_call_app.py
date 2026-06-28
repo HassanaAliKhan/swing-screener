@@ -15,7 +15,6 @@ st.set_page_config(
     layout="wide",
 )
 
-
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
@@ -25,39 +24,26 @@ def default_watchlist() -> str:
     return "# Add one ticker per line\n"
 
 
-def currency(value: object) -> str:
-    try:
-        return f"${float(value):,.2f}"
-    except (TypeError, ValueError):
-        return "—"
-
-
-def pct(value: object) -> str:
-    try:
-        return f"{float(value):.2f}%"
-    except (TypeError, ValueError):
-        return "—"
-
-
 st.title("Friday Covered-Call Screener")
 st.caption(
     "Finds the lowest-strike qualifying call per ticker for the nearest listed Friday expiry. "
-    "This is an options-chain review tool; it does not place orders."
+    "Default option credit is Mark = (Bid + Ask) / 2."
 )
 
 st.warning(
     "Assumption: covered call — you own or buy 100 shares and sell one call. "
-    "Yahoo/yfinance option quotes can be delayed, stale, incomplete, or unavailable. "
-    "Confirm the live bid, ask, contract multiplier, expiry, and liquidity with your broker before trading."
+    "Mark is a midpoint estimate, not a guaranteed fill. Confirm the live bid, ask, "
+    "spread, liquidity, contract multiplier, expiry, and limit-order fill with your broker."
 )
 
 with st.expander("How the calculations work", expanded=False):
     st.markdown(
         """
-- **Assignment break-even / capped-sale value** = `strike + premium received`.
-- **Assignment profit %** = `(strike + premium − spot) / spot × 100`.
-- **Max fall before covered-call loss %** = `premium / spot × 100`. This is the premium buffer for the combined stock-plus-call position at expiry, before commissions, taxes, slippage, early assignment, and any changes to the option price before expiry.
-- **Covered-call downside break-even** = `spot − premium`.
+- **Mark** = `(bid + ask) / 2`.
+- **Assignment break-even / called-away value** = `strike + premium used`.
+- **Assignment profit %** = `(strike + premium used − spot) / spot × 100`.
+- **Maximum fall before covered-call loss %** = `premium used / spot × 100`.
+- **Covered-call downside break-even** = `spot − premium used`.
 - The screener selects **one contract per ticker: the lowest strike** satisfying every active rule.
         """
     )
@@ -109,9 +95,9 @@ with st.expander("Watchlist and scan settings", expanded=True):
     with row1[3]:
         premium_basis_label = st.selectbox(
             "Premium used in calculation",
-            options=["Bid — conservative", "Midpoint", "Last trade"],
+            options=["Mark — (Bid + Ask) / 2", "Bid — conservative", "Last trade"],
             index=0,
-            help="Bid is the conservative default because it is the price currently offered by buyers.",
+            help="Mark matches the midpoint used by many broker displays. It is not guaranteed executable.",
         )
 
     row2 = st.columns(4)
@@ -136,8 +122,9 @@ with st.expander("Watchlist and scan settings", expanded=True):
             "Maximum bid-ask spread (%)",
             min_value=1.0,
             max_value=300.0,
-            value=30.0,
+            value=100.0,
             step=5.0,
+            help="A higher value allows illiquid contracts such as HIVE to appear; review wide spreads manually.",
         )
     with row2[3]:
         workers = st.slider("Yahoo request concurrency", min_value=1, max_value=5, value=3)
@@ -163,8 +150,8 @@ if run_scan:
         st.stop()
 
     basis_map = {
+        "Mark — (Bid + Ask) / 2": "mark",
         "Bid — conservative": "bid",
-        "Midpoint": "midpoint",
         "Last trade": "last",
     }
     config = screener.ScanConfig(
@@ -218,8 +205,10 @@ if "cc_output" in st.session_state:
         st.info("No call contracts passed every active filter in this scan.")
     else:
         visible_columns = [
-            "Ticker", "Spot", "Expiry", "Strike", "StrikeDiscount_pct", "Bid", "Ask",
-            "PremiumUsed", "AssignmentBreakEven", "AssignmentProfit_pct",
+            "Ticker", "Spot", "Expiry", "Strike", "StrikeDiscount_pct",
+            "Bid", "Ask", "Mark", "Last", "PremiumBasis", "PremiumUsed",
+            "RequiredCredit_MinProfit", "RequiredCredit_MaxProfit",
+            "AssignmentBreakEven", "AssignmentProfit_pct",
             "MaxFallBeforeCoveredCallLoss_pct", "CoveredCallDownsideBreakeven",
             "BidAskSpread_pct", "OpenInterest", "OptionVolume", "ImpliedVolatility_pct",
             "ContractSymbol",
@@ -234,7 +223,11 @@ if "cc_output" in st.session_state:
                 "Strike": st.column_config.NumberColumn(format="$%.2f"),
                 "Bid": st.column_config.NumberColumn(format="$%.2f"),
                 "Ask": st.column_config.NumberColumn(format="$%.2f"),
+                "Mark": st.column_config.NumberColumn(format="$%.2f"),
+                "Last": st.column_config.NumberColumn(format="$%.2f"),
                 "PremiumUsed": st.column_config.NumberColumn(format="$%.2f"),
+                "RequiredCredit_MinProfit": st.column_config.NumberColumn(format="$%.2f"),
+                "RequiredCredit_MaxProfit": st.column_config.NumberColumn(format="$%.2f"),
                 "AssignmentBreakEven": st.column_config.NumberColumn(format="$%.2f"),
                 "CoveredCallDownsideBreakeven": st.column_config.NumberColumn(format="$%.2f"),
                 "StrikeDiscount_pct": st.column_config.NumberColumn(format="%.2f%%"),
@@ -245,8 +238,8 @@ if "cc_output" in st.session_state:
             },
         )
         st.caption(
-            "Sorted from maximum to minimum premium downside buffer: `PremiumUsed / Spot`. "
-            "The next sort key is strike distance below spot."
+            "Sorted from maximum to minimum premium downside buffer: `premium used / spot`. "
+            "Mark is a midpoint estimate, not a guaranteed fill."
         )
         st.download_button(
             "Download covered-call candidates CSV",
