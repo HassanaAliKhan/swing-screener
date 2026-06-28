@@ -206,7 +206,7 @@ if "cc_output" in st.session_state:
     else:
         visible_columns = [
             "Ticker", "Spot", "Expiry", "Strike", "StrikeDiscount_pct",
-            "Bid", "Ask", "Mark", "Last", "PremiumBasis", "PremiumUsed",
+            "Bid", "Ask", "Mark", "MarkBidGap", "MarkBidGap_pct", "Last", "PremiumBasis", "PremiumUsed",
             "RequiredCredit_MinProfit", "RequiredCredit_MaxProfit",
             "AssignmentBreakEven", "AssignmentProfit_pct",
             "MaxFallBeforeCoveredCallLoss_pct", "CoveredCallDownsideBreakeven",
@@ -224,6 +224,14 @@ if "cc_output" in st.session_state:
                 "Bid": st.column_config.NumberColumn(format="$%.2f"),
                 "Ask": st.column_config.NumberColumn(format="$%.2f"),
                 "Mark": st.column_config.NumberColumn(format="$%.2f"),
+                "MarkBidGap": st.column_config.NumberColumn(
+                    "Mark − Bid", format="$%.2f",
+                    help="Midpoint mark minus current bid. Smaller is closer to an executable bid."
+                ),
+                "MarkBidGap_pct": st.column_config.NumberColumn(
+                    "Mark − Bid %", format="%.2f%%",
+                    help="Mark-to-bid gap as a percentage of Mark. The final list is sorted smallest first."
+                ),
                 "Last": st.column_config.NumberColumn(format="$%.2f"),
                 "PremiumUsed": st.column_config.NumberColumn(format="$%.2f"),
                 "RequiredCredit_MinProfit": st.column_config.NumberColumn(format="$%.2f"),
@@ -238,8 +246,9 @@ if "cc_output" in st.session_state:
             },
         )
         st.caption(
-            "Sorted from maximum to minimum premium downside buffer: `premium used / spot`. "
-            "Mark is a midpoint estimate, not a guaranteed fill."
+            "Sorted by the smallest Mark-to-Bid gap percentage, then the smallest dollar gap. "
+            "A smaller gap means the midpoint Mark is closer to the executable Bid. "
+            "Mark is still an estimate, not a guaranteed fill."
         )
         st.download_button(
             "Download covered-call candidates CSV",
