@@ -2,8 +2,9 @@
 """
 Friday Covered-Call Screener — Mark-Priced Version
 
-Finds one lowest-strike call per ticker for the nearest listed Friday expiry
-when all of the following are true:
+Finds one lowest-strike call per ticker for the coming listed Friday expiry
+within a strict maximum number of calendar days (default: 10) when all of the
+following are true:
   * strike is at least X% below the underlying spot price;
   * the selected call-credit basis produces Y% to Z% assignment profit;
   * option liquidity/spread filters pass.
@@ -72,6 +73,9 @@ class ScanConfig:
     max_workers: int = 3
     retries: int = 2
     retry_delay_seconds: float = 0.8
+    # Hard expiry window: do not substitute a farther-dated monthly/weekly chain.
+    # Default 10 days keeps the scan on the coming Friday or holiday-shifted Thursday.
+    max_expiry_days: int = 10
     today: date | None = None
 
 
@@ -131,18 +135,28 @@ def next_friday_on_or_after(day: date) -> date:
     return day.fromordinal(day.toordinal() + (4 - day.weekday()) % 7)
 
 
+class NoEligibleExpiry(ValueError):
+    """Raised when no coming weekly expiry is available inside the configured window."""
+
+
 def choose_nearest_friday_expiry(
     expiration_strings: Iterable[str],
     today: date | None = None,
+    max_expiry_days: int = 10,
 ) -> tuple[str, str]:
-    """
-    Choose the coming listed Friday expiry.
+    """Choose only the coming Friday weekly expiry within the maximum day window.
 
-    When a holiday moves weekly expiration to Thursday, use a listed expiry within
-    one day of Friday. If no Friday is listed, fall back to the nearest available
-    future expiry and expose the reason in output.
+    A market holiday can move the weekly expiry to Thursday, so an expiry exactly
+    one calendar day before or after the coming Friday is accepted. The function
+    NEVER falls forward to a farther weekly/monthly expiry. For example, if the
+    coming weekly expiry is absent but the next listed chain is 19 days away, the
+    ticker is returned as ``NO_EXPIRY_WINDOW`` rather than using that 19-day chain.
     """
     today = today or date.today()
+    max_expiry_days = int(max_expiry_days)
+    if max_expiry_days < 1:
+        raise ValueError("max_expiry_days must be at least 1")
+
     parsed: list[tuple[date, str]] = []
     for raw in expiration_strings:
         try:
@@ -152,23 +166,32 @@ def choose_nearest_friday_expiry(
 
     future = sorted((item for item in parsed if item[0] >= today), key=lambda item: item[0])
     if not future:
-        raise ValueError("Yahoo returned no future option expirations")
+        raise NoEligibleExpiry("Yahoo returned no future option expirations")
+
+    cutoff = today.fromordinal(today.toordinal() + max_expiry_days)
+    in_window = [item for item in future if item[0] <= cutoff]
+    if not in_window:
+        nearest = future[0][0].isoformat()
+        raise NoEligibleExpiry(
+            f"No listed option expiration within {max_expiry_days} calendar days "
+            f"(nearest Yahoo expiry: {nearest})"
+        )
 
     target = next_friday_on_or_after(today)
-    exact = [item for item in future if item[0] == target]
+    exact = [item for item in in_window if item[0] == target]
     if exact:
-        return exact[0][1], "Exact Friday expiration"
+        return exact[0][1], "Exact coming Friday expiration"
 
-    holiday_shift = [item for item in future if abs((item[0] - target).days) <= 1]
+    holiday_shift = [item for item in in_window if abs((item[0] - target).days) <= 1]
     if holiday_shift:
         chosen = min(holiday_shift, key=lambda item: (abs((item[0] - target).days), item[0]))
-        return chosen[1], "Nearest listed weekly expiry (holiday-adjusted)"
+        return chosen[1], "Coming weekly expiry (holiday-adjusted)"
 
-    friday_after = [item for item in future if item[0].weekday() == 4 and item[0] > target]
-    if friday_after:
-        return friday_after[0][1], "Next listed Friday expiration"
-
-    return future[0][1], "No Friday expiration listed; nearest available expiration used"
+    available = ", ".join(item[0].isoformat() for item in in_window[:4]) or "none"
+    raise NoEligibleExpiry(
+        f"No coming Friday/holiday-shifted weekly expiry within {max_expiry_days} calendar days "
+        f"(available inside window: {available})"
+    )
 
 
 def _last_non_null_close(frame: pd.DataFrame) -> tuple[float, str | None]:
@@ -348,6 +371,7 @@ def select_lowest_strike_call(
         "SpotTimestamp": spot_timestamp or "",
         "Expiry": expiry,
         "ExpirySelection": expiry_note,
+        "DaysToExpiry": (datetime.strptime(expiry, "%Y-%m-%d").date() - (config.today or date.today())).days,
         "ContractSymbol": str(chosen.get("contractSymbol", "")),
         "Strike": round_or_nan(safe_float(chosen["strike"])),
         "StrikeDiscount_pct": round_or_nan(safe_float(chosen["StrikeDiscount_pct"])),
@@ -394,6 +418,7 @@ def scan_one_ticker(ticker: str, config: ScanConfig) -> tuple[dict | None, dict,
             expiry, expiry_note = choose_nearest_friday_expiry(
                 ticker_obj.options,
                 today=config.today,
+                max_expiry_days=config.max_expiry_days,
             )
             chain = ticker_obj.option_chain(expiry)
             candidate, reason = select_lowest_strike_call(
@@ -412,10 +437,25 @@ def scan_one_ticker(ticker: str, config: ScanConfig) -> tuple[dict | None, dict,
                 "Expiry": expiry,
                 "ExpirySelection": expiry_note,
                 "PremiumBasis": config.premium_basis,
+                "MaxExpiryDays": config.max_expiry_days,
                 "Result": "QUALIFIED" if candidate is not None else "NO_MATCH",
                 "Reason": reason,
             }
             return candidate, diagnostic, None
+        except NoEligibleExpiry as exc:
+            # This is an expected result: do not use a farther-dated chain and do
+            # not report it as a Yahoo data error.
+            diagnostic = {
+                "Ticker": ticker,
+                "Spot": math.nan,
+                "Expiry": "",
+                "ExpirySelection": "",
+                "PremiumBasis": config.premium_basis,
+                "MaxExpiryDays": config.max_expiry_days,
+                "Result": "NO_EXPIRY_WINDOW",
+                "Reason": str(exc),
+            }
+            return None, diagnostic, None
         except Exception as exc:
             if attempt >= max(1, config.retries):
                 error = {"Ticker": ticker, "Error": f"{type(exc).__name__}: {exc}"}
@@ -425,6 +465,7 @@ def scan_one_ticker(ticker: str, config: ScanConfig) -> tuple[dict | None, dict,
                     "Expiry": "",
                     "ExpirySelection": "",
                     "PremiumBasis": config.premium_basis,
+                    "MaxExpiryDays": config.max_expiry_days,
                     "Result": "ERROR",
                     "Reason": error["Error"],
                 }
@@ -461,6 +502,7 @@ def scan_tickers(
                     "Expiry": "",
                     "ExpirySelection": "",
                     "PremiumBasis": config.premium_basis,
+                    "MaxExpiryDays": config.max_expiry_days,
                     "Result": "ERROR",
                     "Reason": f"Worker error: {type(exc).__name__}: {exc}",
                 }
@@ -506,7 +548,7 @@ def write_csv(rows: list[dict], path: Path, columns: list[str] | None = None) ->
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Screen coming-Friday calls for deep-ITM covered-call review.",
+        description="Screen only the coming-Friday weekly calls within a strict DTE window for deep-ITM covered-call review.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--tickers-file", type=Path, default=None)
@@ -518,6 +560,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-open-interest", type=int, default=10)
     parser.add_argument("--min-option-volume", type=int, default=0)
     parser.add_argument("--max-bid-ask-spread-pct", type=float, default=100.0)
+    parser.add_argument(
+        "--max-expiry-days",
+        type=int,
+        default=10,
+        help="Strict maximum calendar days to expiration. No farther chain is substituted.",
+    )
     parser.add_argument("--include-extended-spot", action="store_true")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--retries", type=int, default=2)
@@ -539,6 +587,7 @@ def main() -> None:
         min_open_interest=args.min_open_interest,
         min_option_volume=args.min_option_volume,
         max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
+        max_expiry_days=args.max_expiry_days,
         include_extended_spot=args.include_extended_spot,
         max_workers=args.max_workers,
         retries=args.retries,
@@ -547,7 +596,8 @@ def main() -> None:
     print(
         f"Scanning {len(tickers)} tickers | strike discount >= {config.min_strike_discount_pct:.2f}% | "
         f"assignment profit {config.min_assignment_profit_pct:.2f}% to "
-        f"{config.max_assignment_profit_pct:.2f}% | premium={config.premium_basis}"
+        f"{config.max_assignment_profit_pct:.2f}% | premium={config.premium_basis} | "
+        f"max expiry={config.max_expiry_days} days"
     )
 
     def progress(done: int, total: int, ticker: str, status: str) -> None:
@@ -557,7 +607,7 @@ def main() -> None:
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     result_columns = [
-        "Ticker", "Spot", "Expiry", "ExpirySelection", "ContractSymbol", "Strike",
+        "Ticker", "Spot", "Expiry", "DaysToExpiry", "ExpirySelection", "ContractSymbol", "Strike",
         "StrikeDiscount_pct", "Bid", "Ask", "Mark", "MarkBidGap", "MarkBidGap_pct", "Last", "PremiumBasis", "PremiumUsed",
         "RequiredCredit_MinProfit", "RequiredCredit_MaxProfit", "AssignmentBreakEven",
         "AssignmentProfit_pct", "MarkAssignmentBreakEven", "MarkAssignmentProfit_pct",
@@ -592,4 +642,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
