@@ -12,6 +12,8 @@ Default credit basis: MARK = (BID + ASK) / 2
 
 Core formulas:
   Mark                         = (Bid + Ask) / 2
+  MarkBidGap                   = Mark - Bid
+  MarkBidGap_pct               = (Mark - Bid) / Mark * 100
   AssignmentBreakEven           = Strike + PremiumUsed
   AssignmentProfit_pct          = (AssignmentBreakEven - Spot) / Spot * 100
   MaxFallBeforeLoss_pct         = PremiumUsed / Spot * 100
@@ -296,6 +298,16 @@ def select_lowest_strike_call(
         axis=1,
     )
 
+    # Gap between the broker-style midpoint mark and the executable bid.
+    # Smaller values mean the displayed mark is closer to the price a buyer
+    # is currently bidding for the call.
+    frame["MarkBidGap"] = frame["Mark"] - frame["bid"]
+    frame["MarkBidGap_pct"] = np.where(
+        frame["Mark"] > 0,
+        frame["MarkBidGap"] / frame["Mark"] * 100.0,
+        np.nan,
+    )
+
     spread_ok = frame["BidAskSpread_pct"].isna() | (
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
     )
@@ -342,6 +354,8 @@ def select_lowest_strike_call(
         "Bid": round_or_nan(safe_float(chosen["bid"])),
         "Ask": round_or_nan(safe_float(chosen["ask"])),
         "Mark": round_or_nan(safe_float(chosen["Mark"])),
+        "MarkBidGap": round_or_nan(safe_float(chosen["MarkBidGap"])),
+        "MarkBidGap_pct": round_or_nan(safe_float(chosen["MarkBidGap_pct"])),
         "Last": round_or_nan(safe_float(chosen["lastPrice"])),
         "PremiumBasis": config.premium_basis,
         "PremiumUsed": round_or_nan(safe_float(chosen["PremiumUsed"])),
@@ -460,15 +474,24 @@ def scan_tickers(
             if progress_callback is not None:
                 progress_callback(completed, len(tickers), ticker, diagnostic["Result"])
 
-    # Requested order: highest premium downside buffer / maximum fall protection first.
-    candidates.sort(
-        key=lambda row: (
-            safe_float(row["MaxFallBeforeCoveredCallLoss_pct"]),
-            safe_float(row["StrikeDiscount_pct"]),
-            safe_float(row["AssignmentProfit_pct"]),
-        ),
-        reverse=True,
-    )
+    # Primary order: smallest gap between midpoint Mark and executable Bid.
+    # Use percentage gap first so options with different dollar prices compare fairly;
+    # use the dollar gap next, then preserve the prior strategy tie-breakers.
+    def candidate_sort_key(row: dict) -> tuple[float, float, float, float, float]:
+        gap_pct = safe_float(row.get("MarkBidGap_pct"))
+        gap = safe_float(row.get("MarkBidGap"))
+        downside = safe_float(row.get("MaxFallBeforeCoveredCallLoss_pct"))
+        discount = safe_float(row.get("StrikeDiscount_pct"))
+        profit = safe_float(row.get("AssignmentProfit_pct"))
+        return (
+            gap_pct if math.isfinite(gap_pct) else float("inf"),
+            gap if math.isfinite(gap) else float("inf"),
+            -downside if math.isfinite(downside) else float("inf"),
+            -discount if math.isfinite(discount) else float("inf"),
+            -profit if math.isfinite(profit) else float("inf"),
+        )
+
+    candidates.sort(key=candidate_sort_key)
     diagnostics.sort(key=lambda row: row["Ticker"])
     errors.sort(key=lambda row: row["Ticker"])
     return ScanOutput(candidates, diagnostics, errors)
@@ -535,7 +558,7 @@ def main() -> None:
 
     result_columns = [
         "Ticker", "Spot", "Expiry", "ExpirySelection", "ContractSymbol", "Strike",
-        "StrikeDiscount_pct", "Bid", "Ask", "Mark", "Last", "PremiumBasis", "PremiumUsed",
+        "StrikeDiscount_pct", "Bid", "Ask", "Mark", "MarkBidGap", "MarkBidGap_pct", "Last", "PremiumBasis", "PremiumUsed",
         "RequiredCredit_MinProfit", "RequiredCredit_MaxProfit", "AssignmentBreakEven",
         "AssignmentProfit_pct", "MarkAssignmentBreakEven", "MarkAssignmentProfit_pct",
         "BidAssignmentProfit_pct", "AskAssignmentProfit_pct", "MaxFallBeforeCoveredCallLoss_pct",
@@ -553,7 +576,7 @@ def main() -> None:
     print("\n=== LOWEST-STRIKE QUALIFYING COVERED-CALL CANDIDATES ===")
     if output.candidates:
         display_columns = [
-            "Ticker", "Spot", "Expiry", "Strike", "Bid", "Ask", "Mark", "PremiumUsed",
+            "Ticker", "Spot", "Expiry", "Strike", "Bid", "Ask", "Mark", "MarkBidGap", "MarkBidGap_pct", "PremiumUsed",
             "AssignmentBreakEven", "AssignmentProfit_pct", "MaxFallBeforeCoveredCallLoss_pct",
             "StrikeDiscount_pct", "BidAskSpread_pct", "OpenInterest", "OptionVolume",
         ]
