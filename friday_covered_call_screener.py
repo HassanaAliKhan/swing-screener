@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Friday Covered-Call Screener
+Friday Covered-Call Screener — Mark-Priced Version
 
 Finds one lowest-strike call per ticker for the nearest listed Friday expiry
-(holiday-adjusted when a Friday expiration is unavailable) when:
-  * strike is at least X% below current stock price; and
-  * strike + premium is between Y% and Z% above the current stock price.
+when all of the following are true:
+  * strike is at least X% below the underlying spot price;
+  * the selected call-credit basis produces Y% to Z% assignment profit;
+  * option liquidity/spread filters pass.
 
-Default interpretation:
-  AssignmentBreakEven = strike + received premium
-  AssignmentProfit_pct = (AssignmentBreakEven - current stock price) / current stock price * 100
+Default credit basis: MARK = (BID + ASK) / 2
 
-The script is designed for covered-call review. It does not place trades.
-Option-chain data are obtained through yfinance/Yahoo and may be delayed,
-stale, incomplete, or temporarily unavailable.
+Core formulas:
+  Mark                         = (Bid + Ask) / 2
+  AssignmentBreakEven           = Strike + PremiumUsed
+  AssignmentProfit_pct          = (AssignmentBreakEven - Spot) / Spot * 100
+  MaxFallBeforeLoss_pct         = PremiumUsed / Spot * 100
+  CoveredCallDownsideBreakeven  = Spot - PremiumUsed
+
+The default strategy range is 1% to 5% assignment profit, with the call
+strike at least 20% below the underlying spot price.
+
+This is a research/review tool. It does not place orders. Yahoo/yfinance
+option quotes may be delayed, stale, incomplete, or unavailable. Mark is a
+midpoint estimate, NOT a guaranteed fill. Confirm the live bid, ask, spread,
+liquidity, and actual limit-order fill with your broker before trading.
 """
 
 from __future__ import annotations
@@ -24,7 +34,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -52,10 +62,10 @@ class ScanConfig:
     min_strike_discount_pct: float = 20.0
     min_assignment_profit_pct: float = 1.0
     max_assignment_profit_pct: float = 5.0
-    premium_basis: str = "bid"  # bid, midpoint, last
+    premium_basis: str = "mark"  # mark, bid, last
     min_open_interest: int = 10
     min_option_volume: int = 0
-    max_bid_ask_spread_pct: float = 30.0
+    max_bid_ask_spread_pct: float = 100.0
     include_extended_spot: bool = False
     max_workers: int = 3
     retries: int = 2
@@ -71,6 +81,7 @@ class ScanOutput:
 
 
 def safe_float(value: object) -> float:
+    """Convert a value to a finite float; otherwise return NaN."""
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -114,6 +125,7 @@ def load_tickers(path: Path | None = None) -> list[str]:
 
 
 def next_friday_on_or_after(day: date) -> date:
+    """Return the Friday falling on or after `day`."""
     return day.fromordinal(day.toordinal() + (4 - day.weekday()) % 7)
 
 
@@ -124,9 +136,9 @@ def choose_nearest_friday_expiry(
     """
     Choose the coming listed Friday expiry.
 
-    If a market holiday shifts weekly expiration to Thursday, use an expiry within
-    one day of the target Friday. If Yahoo does not list any Friday expiry, use
-    the first listed expiry after the target and make that explicit in diagnostics.
+    When a holiday moves weekly expiration to Thursday, use a listed expiry within
+    one day of Friday. If no Friday is listed, fall back to the nearest available
+    future expiry and expose the reason in output.
     """
     today = today or date.today()
     parsed: list[tuple[date, str]] = []
@@ -163,12 +175,11 @@ def _last_non_null_close(frame: pd.DataFrame) -> tuple[float, str | None]:
     close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
     if close.empty:
         return math.nan, None
-    timestamp = str(close.index[-1])
-    return safe_float(close.iloc[-1]), timestamp
+    return safe_float(close.iloc[-1]), str(close.index[-1])
 
 
 def fetch_spot(ticker_obj: yf.Ticker, include_extended: bool) -> tuple[float, str, str | None]:
-    """Get an underlying reference price with multiple Yahoo fallbacks."""
+    """Get underlying reference price using Yahoo fallbacks."""
     try:
         fast = ticker_obj.fast_info
         for key in ("lastPrice", "last_price"):
@@ -178,56 +189,57 @@ def fetch_spot(ticker_obj: yf.Ticker, include_extended: bool) -> tuple[float, st
     except Exception:
         pass
 
-    try:
-        history = ticker_obj.history(
-            period="5d",
-            interval="1m",
-            auto_adjust=False,
-            prepost=include_extended,
-            raise_errors=False,
-        )
-        value, timestamp = _last_non_null_close(history)
-        if value > 0:
-            return value, "history 1m close", timestamp
-    except Exception:
-        pass
-
-    try:
-        history = ticker_obj.history(
-            period="5d",
-            interval="5m",
-            auto_adjust=False,
-            prepost=include_extended,
-            raise_errors=False,
-        )
-        value, timestamp = _last_non_null_close(history)
-        if value > 0:
-            return value, "history 5m close", timestamp
-    except Exception:
-        pass
+    for interval in ("1m", "5m"):
+        try:
+            history = ticker_obj.history(
+                period="5d",
+                interval=interval,
+                auto_adjust=False,
+                prepost=include_extended,
+                raise_errors=False,
+            )
+            value, timestamp = _last_non_null_close(history)
+            if value > 0:
+                return value, f"history {interval} close", timestamp
+        except Exception:
+            pass
 
     raise ValueError("Unable to obtain a valid underlying price from Yahoo")
+
+
+def quote_mark(bid: float, ask: float) -> float:
+    """Return midpoint mark = (bid + ask) / 2 only when both quotes are valid."""
+    if bid > 0 and ask >= bid:
+        return (bid + ask) / 2.0
+    return math.nan
 
 
 def premium_from_quote(row: pd.Series, basis: str) -> float:
     bid = safe_float(row.get("bid"))
     ask = safe_float(row.get("ask"))
     last = safe_float(row.get("lastPrice"))
+    mark = quote_mark(bid, ask)
 
+    if basis == "mark":
+        return mark
     if basis == "bid":
         return bid if bid > 0 else math.nan
-    if basis == "midpoint":
-        return (bid + ask) / 2.0 if bid > 0 and ask > 0 and ask >= bid else math.nan
     if basis == "last":
         return last if last > 0 else math.nan
     raise ValueError(f"Unsupported premium basis: {basis}")
 
 
 def bid_ask_spread_pct(bid: float, ask: float) -> float:
-    if not (bid > 0 and ask >= bid):
+    mark = quote_mark(bid, ask)
+    if not math.isfinite(mark) or mark <= 0:
         return math.nan
-    midpoint = (bid + ask) / 2.0
-    return (ask - bid) / midpoint * 100.0 if midpoint > 0 else math.nan
+    return (ask - bid) / mark * 100.0
+
+
+def _regular_contract_mask(frame: pd.DataFrame) -> pd.Series:
+    if "contractSize" not in frame.columns:
+        return pd.Series(True, index=frame.index)
+    return frame["contractSize"].fillna("REGULAR").astype(str).eq("REGULAR")
 
 
 def select_lowest_strike_call(
@@ -240,36 +252,54 @@ def select_lowest_strike_call(
     spot_source: str,
     spot_timestamp: str | None,
 ) -> tuple[dict | None, str]:
+    """Calculate all quote metrics and return the lowest-strike qualifying call."""
     if calls is None or calls.empty:
         return None, "Yahoo returned an empty call chain"
 
     frame = calls.copy()
-    required = ["strike", "bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility"]
+    required = [
+        "strike", "bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility",
+    ]
     for column in required:
         if column not in frame.columns:
             frame[column] = np.nan
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
+    frame["Mark"] = frame.apply(
+        lambda row: quote_mark(safe_float(row["bid"]), safe_float(row["ask"])),
+        axis=1,
+    )
     frame["PremiumUsed"] = frame.apply(
         lambda row: premium_from_quote(row, config.premium_basis), axis=1
     )
+    frame["PremiumBasis"] = config.premium_basis
+
     frame["StrikeDiscount_pct"] = (spot - frame["strike"]) / spot * 100.0
+    frame["RequiredCredit_1pct"] = spot * (1.0 + config.min_assignment_profit_pct / 100.0) - frame["strike"]
+    frame["RequiredCredit_5pct"] = spot * (1.0 + config.max_assignment_profit_pct / 100.0) - frame["strike"]
+
+    # The field historically requested as "break even" by the strategy: capped
+    # call-away value if stock is assigned. Actual downside breakeven is separate.
     frame["AssignmentBreakEven"] = frame["strike"] + frame["PremiumUsed"]
     frame["AssignmentProfit_pct"] = (frame["AssignmentBreakEven"] - spot) / spot * 100.0
+    frame["MarkAssignmentBreakEven"] = frame["strike"] + frame["Mark"]
+    frame["MarkAssignmentProfit_pct"] = (frame["MarkAssignmentBreakEven"] - spot) / spot * 100.0
+    frame["BidAssignmentBreakEven"] = frame["strike"] + frame["bid"]
+    frame["BidAssignmentProfit_pct"] = (frame["BidAssignmentBreakEven"] - spot) / spot * 100.0
+    frame["AskAssignmentBreakEven"] = frame["strike"] + frame["ask"]
+    frame["AskAssignmentProfit_pct"] = (frame["AskAssignmentBreakEven"] - spot) / spot * 100.0
+
     frame["MaxFallBeforeCoveredCallLoss_pct"] = frame["PremiumUsed"] / spot * 100.0
     frame["CoveredCallDownsideBreakeven"] = spot - frame["PremiumUsed"]
     frame["BidAskSpread_pct"] = frame.apply(
-        lambda row: bid_ask_spread_pct(safe_float(row["bid"]), safe_float(row["ask"])), axis=1
+        lambda row: bid_ask_spread_pct(safe_float(row["bid"]), safe_float(row["ask"])),
+        axis=1,
     )
 
     spread_ok = frame["BidAskSpread_pct"].isna() | (
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
     )
-    regular_contract_ok = (
-        frame["contractSize"].eq("REGULAR")
-        if "contractSize" in frame.columns
-        else pd.Series(True, index=frame.index)
-    )
+    regular_contract_ok = _regular_contract_mask(frame)
 
     qualifying = frame.loc[
         (frame["strike"] > 0)
@@ -284,10 +314,10 @@ def select_lowest_strike_call(
     ].copy()
 
     if qualifying.empty:
-        return None, "No call met the active strike, premium, liquidity, and spread filters"
+        return None, "No call met active strike, mark/credit, liquidity, and spread filters"
 
-    # User requested the least / lowest eligible strike. Break ties with better
-    # upside result and tighter quoted spread.
+    # User requested the least / lowest eligible strike. Break ties by profit,
+    # premium buffer, then tighter bid-ask spread.
     qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
     qualifying = qualifying.sort_values(
         by=["strike", "AssignmentProfit_pct", "PremiumUsed", "_spread_sort"],
@@ -296,7 +326,6 @@ def select_lowest_strike_call(
     )
     chosen = qualifying.iloc[0]
 
-    contract_symbol = str(chosen.get("contractSymbol", ""))
     last_trade = chosen.get("lastTradeDate", "")
     last_trade_text = str(last_trade) if pd.notna(last_trade) else ""
 
@@ -307,16 +336,23 @@ def select_lowest_strike_call(
         "SpotTimestamp": spot_timestamp or "",
         "Expiry": expiry,
         "ExpirySelection": expiry_note,
-        "ContractSymbol": contract_symbol,
+        "ContractSymbol": str(chosen.get("contractSymbol", "")),
         "Strike": round_or_nan(safe_float(chosen["strike"])),
         "StrikeDiscount_pct": round_or_nan(safe_float(chosen["StrikeDiscount_pct"])),
         "Bid": round_or_nan(safe_float(chosen["bid"])),
         "Ask": round_or_nan(safe_float(chosen["ask"])),
+        "Mark": round_or_nan(safe_float(chosen["Mark"])),
         "Last": round_or_nan(safe_float(chosen["lastPrice"])),
         "PremiumBasis": config.premium_basis,
         "PremiumUsed": round_or_nan(safe_float(chosen["PremiumUsed"])),
+        "RequiredCredit_MinProfit": round_or_nan(safe_float(chosen["RequiredCredit_1pct"])),
+        "RequiredCredit_MaxProfit": round_or_nan(safe_float(chosen["RequiredCredit_5pct"])),
         "AssignmentBreakEven": round_or_nan(safe_float(chosen["AssignmentBreakEven"])),
         "AssignmentProfit_pct": round_or_nan(safe_float(chosen["AssignmentProfit_pct"])),
+        "MarkAssignmentBreakEven": round_or_nan(safe_float(chosen["MarkAssignmentBreakEven"])),
+        "MarkAssignmentProfit_pct": round_or_nan(safe_float(chosen["MarkAssignmentProfit_pct"])),
+        "BidAssignmentProfit_pct": round_or_nan(safe_float(chosen["BidAssignmentProfit_pct"])),
+        "AskAssignmentProfit_pct": round_or_nan(safe_float(chosen["AskAssignmentProfit_pct"])),
         "MaxFallBeforeCoveredCallLoss_pct": round_or_nan(
             safe_float(chosen["MaxFallBeforeCoveredCallLoss_pct"])
         ),
@@ -361,21 +397,20 @@ def scan_one_ticker(ticker: str, config: ScanConfig) -> tuple[dict | None, dict,
                 "Spot": round_or_nan(spot),
                 "Expiry": expiry,
                 "ExpirySelection": expiry_note,
+                "PremiumBasis": config.premium_basis,
                 "Result": "QUALIFIED" if candidate is not None else "NO_MATCH",
                 "Reason": reason,
             }
             return candidate, diagnostic, None
         except Exception as exc:
             if attempt >= max(1, config.retries):
-                error = {
-                    "Ticker": ticker,
-                    "Error": f"{type(exc).__name__}: {exc}",
-                }
+                error = {"Ticker": ticker, "Error": f"{type(exc).__name__}: {exc}"}
                 diagnostic = {
                     "Ticker": ticker,
                     "Spot": math.nan,
                     "Expiry": "",
                     "ExpirySelection": "",
+                    "PremiumBasis": config.premium_basis,
                     "Result": "ERROR",
                     "Reason": error["Error"],
                 }
@@ -399,21 +434,19 @@ def scan_tickers(
 
     workers = max(1, min(int(config.max_workers), 8))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(scan_one_ticker, ticker, config): ticker
-            for ticker in tickers
-        }
+        futures = {executor.submit(scan_one_ticker, ticker, config): ticker for ticker in tickers}
         for completed, future in enumerate(as_completed(futures), start=1):
             ticker = futures[future]
             try:
                 candidate, diagnostic, error = future.result()
-            except Exception as exc:  # Defensive worker guard.
+            except Exception as exc:
                 candidate = None
                 diagnostic = {
                     "Ticker": ticker,
                     "Spot": math.nan,
                     "Expiry": "",
                     "ExpirySelection": "",
+                    "PremiumBasis": config.premium_basis,
                     "Result": "ERROR",
                     "Reason": f"Worker error: {type(exc).__name__}: {exc}",
                 }
@@ -427,8 +460,7 @@ def scan_tickers(
             if progress_callback is not None:
                 progress_callback(completed, len(tickers), ticker, diagnostic["Result"])
 
-    # "Max to least fall" is implemented as maximum downside buffer from the
-    # premium received: premium / spot. Strike discount is the secondary key.
+    # Requested order: highest premium downside buffer / maximum fall protection first.
     candidates.sort(
         key=lambda row: (
             safe_float(row["MaxFallBeforeCoveredCallLoss_pct"]),
@@ -459,10 +491,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-strike-discount-pct", type=float, default=20.0)
     parser.add_argument("--min-assignment-profit-pct", type=float, default=1.0)
     parser.add_argument("--max-assignment-profit-pct", type=float, default=5.0)
-    parser.add_argument("--premium-basis", choices=["bid", "midpoint", "last"], default="bid")
+    parser.add_argument("--premium-basis", choices=["mark", "bid", "last"], default="mark")
     parser.add_argument("--min-open-interest", type=int, default=10)
     parser.add_argument("--min-option-volume", type=int, default=0)
-    parser.add_argument("--max-bid-ask-spread-pct", type=float, default=30.0)
+    parser.add_argument("--max-bid-ask-spread-pct", type=float, default=100.0)
     parser.add_argument("--include-extended-spot", action="store_true")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--retries", type=int, default=2)
@@ -503,8 +535,10 @@ def main() -> None:
 
     result_columns = [
         "Ticker", "Spot", "Expiry", "ExpirySelection", "ContractSymbol", "Strike",
-        "StrikeDiscount_pct", "Bid", "Ask", "Last", "PremiumBasis", "PremiumUsed",
-        "AssignmentBreakEven", "AssignmentProfit_pct", "MaxFallBeforeCoveredCallLoss_pct",
+        "StrikeDiscount_pct", "Bid", "Ask", "Mark", "Last", "PremiumBasis", "PremiumUsed",
+        "RequiredCredit_MinProfit", "RequiredCredit_MaxProfit", "AssignmentBreakEven",
+        "AssignmentProfit_pct", "MarkAssignmentBreakEven", "MarkAssignmentProfit_pct",
+        "BidAssignmentProfit_pct", "AskAssignmentProfit_pct", "MaxFallBeforeCoveredCallLoss_pct",
         "CoveredCallDownsideBreakeven", "BidAskSpread_pct", "OptionVolume", "OpenInterest",
         "ImpliedVolatility_pct", "InTheMoney", "LastTradeDate", "SpotSource", "SpotTimestamp",
         "Strategy",
@@ -519,9 +553,9 @@ def main() -> None:
     print("\n=== LOWEST-STRIKE QUALIFYING COVERED-CALL CANDIDATES ===")
     if output.candidates:
         display_columns = [
-            "Ticker", "Spot", "Expiry", "Strike", "PremiumUsed", "AssignmentBreakEven",
-            "AssignmentProfit_pct", "MaxFallBeforeCoveredCallLoss_pct", "StrikeDiscount_pct",
-            "BidAskSpread_pct", "OpenInterest", "OptionVolume",
+            "Ticker", "Spot", "Expiry", "Strike", "Bid", "Ask", "Mark", "PremiumUsed",
+            "AssignmentBreakEven", "AssignmentProfit_pct", "MaxFallBeforeCoveredCallLoss_pct",
+            "StrikeDiscount_pct", "BidAskSpread_pct", "OpenInterest", "OptionVolume",
         ]
         print(pd.DataFrame(output.candidates)[display_columns].to_string(index=False))
     else:
