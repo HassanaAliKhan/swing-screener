@@ -2,8 +2,8 @@
 # You can add, remove, or reorder tickers anytime.
 # Use the exact Yahoo Finance ticker format when a symbol differs from the US ticker.
 
-Stock
 MOVE
+APH
 YSS
 SMCI
 BTBT
