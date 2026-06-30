@@ -1,7 +1,7 @@
+```python
 from __future__ import annotations
 
 import concurrent.futures
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -96,7 +96,7 @@ def default_watchlist() -> str:
 
 
 def parse_watchlist(raw_text: str) -> list[str]:
-    """Same behavior as the CLI watchlist parser: comments, commas, blanks, and duplicates are ignored."""
+    """Parse watchlist text while ignoring comments, blanks, commas, and duplicates."""
     out: list[str] = []
     seen: set[str] = set()
 
@@ -107,6 +107,7 @@ def parse_watchlist(raw_text: str) -> list[str]:
             if ticker and ticker not in seen:
                 seen.add(ticker)
                 out.append(ticker)
+
     return out
 
 
@@ -120,7 +121,7 @@ def build_args(
 ) -> SimpleNamespace:
     settings = dict(PROFILE_SETTINGS[profile])
 
-    # Front-end fields intentionally override profile defaults.
+    # Front-end controls override profile defaults.
     settings["target_pct"] = float(target_pct)
     settings["min_rel_volume"] = float(custom_rel_volume)
     settings["min_score"] = int(custom_min_score)
@@ -135,8 +136,13 @@ def build_args(
             "download_retries": 3,
             "retry_delay_seconds": 1.0,
             "max_workers": int(workers),
+
+            # Required by target_clear_of_resistance() in the backend scanner.
+            # Matches the command-line script default.
+            "resistance_target_buffer_pct": 0.50,
         }
     )
+
     return SimpleNamespace(**settings)
 
 
@@ -147,10 +153,11 @@ def scan_watchlist(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Run the same backend engine as the desktop script.
+
     Returns:
-      good entries,
-      all classifications,
-      provider/data errors.
+      - potential long entries
+      - all classifications
+      - Yahoo/provider/data errors
     """
     data_by_ticker: dict[str, pd.DataFrame] = {}
     errors: list[dict[str, str]] = []
@@ -160,7 +167,9 @@ def scan_watchlist(
     completed = 0
     total = len(tickers)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, args.max_workers)
+    ) as executor:
         jobs = {
             executor.submit(
                 scanner.fetch_hourly,
@@ -178,24 +187,41 @@ def scan_watchlist(
         for future in concurrent.futures.as_completed(jobs):
             ticker, frame, error = future.result()
             completed += 1
+
             if frame is None:
-                errors.append({"Ticker": ticker, "Error": error or "Unknown Yahoo data error"})
+                errors.append(
+                    {
+                        "Ticker": ticker,
+                        "Error": error or "Unknown Yahoo data error",
+                    }
+                )
             else:
                 data_by_ticker[ticker] = frame
+
             progress_callback(completed, total, ticker)
 
-    for index, ticker in enumerate(tickers, start=1):
+    for ticker in tickers:
         frame = data_by_ticker.get(ticker)
+
         if frame is None:
             continue
+
         try:
             candidate, debug = scanner.classify_ticker(ticker, frame, args)
             classifications.append(debug)
+
             if candidate is not None:
                 candidates.append(candidate)
+
         except Exception as exc:
             errors.append(
-                {"Ticker": ticker, "Error": f"Classification error: {type(exc).__name__}: {exc}"}
+                {
+                    "Ticker": ticker,
+                    "Error": (
+                        f"Classification error: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
             )
 
     candidates.sort(
@@ -206,6 +232,7 @@ def scan_watchlist(
         ),
         reverse=True,
     )
+
     classifications.sort(key=lambda row: row.get("Ticker", ""))
     errors.sort(key=lambda row: row.get("Ticker", ""))
 
@@ -223,8 +250,8 @@ def dataframe_csv(df: pd.DataFrame) -> bytes:
 def title_block() -> None:
     st.title("Hourly Swing Screener")
     st.caption(
-        "On-demand 60-minute chart scan. Output contains only potential long-entry "
-        "candidates using the selected 5% swing framework."
+        "On-demand 60-minute chart scan. Output contains only potential "
+        "long-entry candidates using the selected swing framework."
     )
 
 
@@ -242,24 +269,31 @@ with st.expander("Watchlist and scan settings", expanded=False):
         "Watchlist",
         key="watchlist_text",
         height=250,
-        help="One symbol per line. Blank lines and # comments are ignored. Changes apply to this browser session.",
+        help=(
+            "One symbol per line. Blank lines and # comments are ignored. "
+            "Changes apply only to this browser session."
+        ),
     )
+
     st.caption(
-        "To permanently change the default list for everyone using this app, edit "
-        "`watchlist.txt` in the GitHub repository and commit it."
+        "To permanently change the default list, edit `watchlist.txt` "
+        "in the GitHub repository and commit it."
     )
 
     controls_1, controls_2, controls_3 = st.columns(3)
+
     with controls_1:
         profile = st.selectbox(
             "Scan profile",
             options=["Balanced", "Relaxed review", "Strict"],
             index=0,
             help=(
-                "Balanced is the recommended default. Relaxed review produces more charts "
-                "for manual inspection. Strict produces fewer, tighter setups."
+                "Balanced is the recommended default. Relaxed review produces "
+                "more charts for manual inspection. Strict produces fewer, "
+                "tighter setups."
             ),
         )
+
     with controls_2:
         target_pct = st.number_input(
             "Profit target (%)",
@@ -268,12 +302,16 @@ with st.expander("Watchlist and scan settings", expanded=False):
             value=5.0,
             step=0.5,
         )
-    with controls_3:
-        include_prepost = st.checkbox("Include premarket / after-hours", value=True)
 
-    # Let the user tune two visible, high-impact gates without exposing every internal option.
+    with controls_3:
+        include_prepost = st.checkbox(
+            "Include premarket / after-hours",
+            value=True,
+        )
+
     baseline = PROFILE_SETTINGS[profile]
     controls_4, controls_5, controls_6 = st.columns(3)
+
     with controls_4:
         min_score = st.slider(
             "Minimum setup score",
@@ -282,6 +320,7 @@ with st.expander("Watchlist and scan settings", expanded=False):
             value=int(baseline["min_score"]),
             step=1,
         )
+
     with controls_5:
         min_rel_volume = st.slider(
             "Minimum relative volume",
@@ -290,22 +329,38 @@ with st.expander("Watchlist and scan settings", expanded=False):
             value=float(baseline["min_rel_volume"]),
             step=0.05,
         )
+
     with controls_6:
         workers = st.select_slider(
             "Yahoo request concurrency",
             options=[1, 2, 3, 4],
             value=3,
-            help="Use 1–2 if Yahoo temporarily returns errors. Higher is faster but can be less reliable.",
+            help=(
+                "Use 1–2 if Yahoo temporarily returns errors. "
+                "Higher is faster but can be less reliable."
+            ),
         )
 
-    show_debug = st.checkbox("Show classifications and data errors after scan", value=True)
+    show_debug = st.checkbox(
+        "Show classifications and data errors after scan",
+        value=True,
+    )
+
 
 tickers = parse_watchlist(st.session_state.watchlist_text)
+
 status_left, status_right = st.columns([3, 1])
+
 with status_left:
     st.write(f"**{len(tickers)} unique tickers loaded**")
+
 with status_right:
-    run_clicked = st.button("Run scan", type="primary", use_container_width=True)
+    run_clicked = st.button(
+        "Run scan",
+        type="primary",
+        use_container_width=True,
+    )
+
 
 if run_clicked:
     if not tickers:
@@ -332,7 +387,11 @@ if run_clicked:
         last_ticker.caption(f"Latest completed data request: {ticker}")
 
     with st.spinner("Scanning completed hourly candles…"):
-        good_entries, classifications, errors = scan_watchlist(tickers, args, update_progress)
+        good_entries, classifications, errors = scan_watchlist(
+            tickers,
+            args,
+            update_progress,
+        )
 
     progress.empty()
     last_ticker.empty()
@@ -348,6 +407,7 @@ if run_clicked:
 if "last_good_entries" not in st.session_state:
     st.info("Choose settings, then tap **Run scan**.")
     st.stop()
+
 
 good_entries: pd.DataFrame = st.session_state.last_good_entries
 classifications: pd.DataFrame = st.session_state.last_classifications
@@ -367,15 +427,16 @@ st.subheader("Good long-entry candidates")
 
 if good_entries.empty:
     st.warning(
-        "No names passed the selected rules. This is a normal result; do not force trades. "
-        "Use **Relaxed review** only to create a broader manual-review list."
+        "No names passed the selected rules. This is a normal result; "
+        "do not force trades. Use **Relaxed review** only to create a "
+        "broader manual-review list."
     )
 else:
-    # Keep display concise and phone-friendly.
     display_columns = [
         "Ticker",
         "Pattern",
         "Score",
+        "LastCompletedHourlyBar",
         "Entry",
         "Stop",
         "Target_5pct",
@@ -385,7 +446,12 @@ else:
         "ResistanceDistance_pct",
         "ResistanceBefore5pctTarget",
     ]
-    available_columns = [c for c in display_columns if c in good_entries.columns]
+
+    available_columns = [
+        column
+        for column in display_columns
+        if column in good_entries.columns
+    ]
 
     st.dataframe(
         good_entries[available_columns],
@@ -399,7 +465,9 @@ else:
             "Risk_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "RewardRisk_to_Target": st.column_config.NumberColumn(format="%.2f"),
             "RelVol20": st.column_config.NumberColumn(format="%.2f×"),
-            "ResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
+            "ResistanceDistance_pct": st.column_config.NumberColumn(
+                format="%.2f%%"
+            ),
         },
     )
 
@@ -414,6 +482,7 @@ else:
     with st.expander("How to read these results", expanded=False):
         st.markdown(
             f"""
+- **LastCompletedHourlyBar** shows how fresh the scan data is.
 - **Entry** is the last fully completed hourly candle close, not a command to market-buy.
 - **Stop** is the structural invalidation point for that pattern.
 - **Target** is Entry × **{target_pct:.1f}%**.
@@ -424,12 +493,18 @@ else:
 """
         )
 
+
 if st.session_state.last_show_debug:
     with st.expander("All classifications", expanded=False):
         if classifications.empty:
             st.info("No ticker classifications available.")
         else:
-            st.dataframe(classifications, use_container_width=True, hide_index=True)
+            st.dataframe(
+                classifications,
+                use_container_width=True,
+                hide_index=True,
+            )
+
             st.download_button(
                 "Download classifications CSV",
                 data=dataframe_csv(classifications),
@@ -442,7 +517,12 @@ if st.session_state.last_show_debug:
         if errors.empty:
             st.success("No provider/data errors.")
         else:
-            st.dataframe(errors, use_container_width=True, hide_index=True)
+            st.dataframe(
+                errors,
+                use_container_width=True,
+                hide_index=True,
+            )
+
             st.download_button(
                 "Download errors CSV",
                 data=dataframe_csv(errors),
@@ -450,3 +530,4 @@ if st.session_state.last_show_debug:
                 mime="text/csv",
                 use_container_width=True,
             )
+```
