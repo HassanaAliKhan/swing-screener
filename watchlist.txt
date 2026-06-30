@@ -2,6 +2,7 @@
 # You can add, remove, or reorder tickers anytime.
 # Use the exact Yahoo Finance ticker format when a symbol differs from the US ticker.
 
+Stock
 MOVE
 YSS
 SMCI
@@ -36,7 +37,6 @@ DLR
 REA
 PXLW
 CRWV
-PEGA
 WULF
 BRUN
 ANY
@@ -94,7 +94,6 @@ CHAT
 PLAB
 SILC
 AVGO
-MGNI
 NTSK
 OSS
 DUOT
@@ -215,3 +214,4 @@ VSAT
 FCEL
 IRDM
 OUST
+
