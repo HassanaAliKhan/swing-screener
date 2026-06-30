@@ -50,6 +50,37 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "early_recovery_max_ema20_distance_pct": 1.75,
         "early_recovery_structure_break_pct": 0.10,
     },
+    "Fresh momentum — broader": {
+        "min_score": 55,
+        "max_risk_pct": 5.0,
+        "min_reward_risk": 1.00,
+        "min_rel_volume": 0.60,
+        "min_hourly_dollar_volume": 150_000,
+        "min_price": 3.00,
+        "pullback_touch_pct": 2.5,
+        "pullback_max_ema20_distance_pct": 3.0,
+        "pullback_volume_multiplier": 1.30,
+        "breakout_event_volume_multiplier": 0.90,
+        "breakout_retest_tolerance_pct": 2.5,
+        "breakout_max_extension_pct": 3.0,
+        "range_support_distance_pct": 3.0,
+        "reversal_higher_low_pct": 0.10,
+        "reversal_structure_break_pct": 0.0,
+        "reversal_min_rel_volume": 0.75,
+        "allow_resistance_before_target": True,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": True,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": True,
+        "fresh_breakout_lookback_bars": 12,
+        "fresh_breakout_min_rel_volume": 0.80,
+        "fresh_breakout_max_extension_pct": 2.00,
+        "allow_early_recovery": True,
+        "early_recovery_lookback_bars": 5,
+        "early_recovery_min_rel_volume": 0.75,
+        "early_recovery_max_ema20_distance_pct": 2.50,
+        "early_recovery_structure_break_pct": 0.0,
+    },
     "Balanced": {
         "min_score": 58,
         "max_risk_pct": 4.5,
@@ -280,12 +311,12 @@ if "watchlist_text" not in st.session_state:
     st.session_state.watchlist_text = default_watchlist()
 
 if "profile_select" not in st.session_state:
-    st.session_state.profile_select = "Fresh momentum"
+    st.session_state.profile_select = "Fresh momentum — broader"
 if "min_score_control" not in st.session_state:
-    st.session_state.min_score_control = int(PROFILE_SETTINGS["Fresh momentum"]["min_score"])
+    st.session_state.min_score_control = int(PROFILE_SETTINGS["Fresh momentum — broader"]["min_score"])
 if "min_rel_volume_control" not in st.session_state:
     st.session_state.min_rel_volume_control = float(
-        PROFILE_SETTINGS["Fresh momentum"]["min_rel_volume"]
+        PROFILE_SETTINGS["Fresh momentum — broader"]["min_rel_volume"]
     )
 
 def reset_profile_controls() -> None:
@@ -315,12 +346,18 @@ with st.expander("Watchlist and scan settings", expanded=False):
     with controls_1:
         profile = st.selectbox(
             "Scan profile",
-            options=["Fresh momentum", "Balanced", "Relaxed review", "Strict"],
+            options=[
+                "Fresh momentum",
+                "Fresh momentum — broader",
+                "Balanced",
+                "Relaxed review",
+                "Strict",
+            ],
             key="profile_select",
             on_change=reset_profile_controls,
             help=(
-                "Fresh momentum finds the earliest current-hour breakout/reclaim. "
-                "It uses stronger volume and tighter extension limits because early signals can fail."
+                "Fresh momentum is the stricter early-signal mode. Fresh momentum — broader "
+                "uses shorter bases, lower volume thresholds, and allows nearby resistance for a larger review list."
             ),
         )
     with controls_2:
@@ -361,10 +398,10 @@ with st.expander("Watchlist and scan settings", expanded=False):
 
     show_debug = st.checkbox("Show classifications and data errors after scan", value=True)
 
-    if profile == "Fresh momentum":
+    if profile.startswith("Fresh momentum"):
         st.caption(
-            "Fresh momentum only accepts signals from the latest completed hourly bar. "
-            "It is designed for idea generation, not automatic orders."
+            "Fresh momentum profiles only accept signals from the latest completed hourly bar. "
+            "The broader mode gives more early ideas but has more false starts; it is not for automatic orders."
         )
 
 tickers = parse_watchlist(st.session_state.watchlist_text)
