@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
 """
-Hourly Swing Screener — 6 Pattern Classifier, configurable 5% target (robust Yahoo data handling)
+Hourly Swing Screener — confirmed and fresh-momentum long setups.
 
-Reads:  watchlist.txt in the same folder (or --tickers-file FILE)
-Writes: output/good_entries.csv   -> ONLY potential long entries
-        output/all_classifications.csv (when --debug)
+The scanner keeps the existing confirmed patterns and adds two earlier signals:
+  - FRESH_BREAKOUT: the latest completed hourly candle has just broken a base.
+  - EARLY_RECOVERY: a recent weak move is reclaiming the 20 EMA / short structure.
 
-Six chart states checked:
-  1. UPTREND_PULLBACK
-  2. DOWNTREND
-  3. RANGE_SIDEWAYS
-  4. BREAKOUT_RETEST
-  5. BREAKDOWN
-  6. REVERSAL_CONFIRM
-
-The original default settings are preserved. New command-line options let you
-relax individual gates without allowing simple downtrends or breakdowns to
-be called long entries.
-
-Install once:
-    python -m pip install -U yfinance pandas numpy
-
-Examples:
-    python swing_screener_6_patterns.py
-    python swing_screener_6_patterns.py --debug
-    python swing_screener_6_patterns.py --help
+Use the Fresh momentum profile in the Streamlit app for these early signals.
+It intentionally requires tighter entry extension and stronger volume than the
+relaxed profiles because first breakouts can fail more often.
 """
 
 from __future__ import annotations
@@ -42,24 +26,9 @@ warnings.filterwarnings(
     message=r"The 'generic' unit for NumPy timedelta is deprecated.*",
     category=DeprecationWarning,
 )
-
-warnings.filterwarnings(
-    "ignore",
-    category=DeprecationWarning,
-    module=r"^yfinance(\..*)?$",
-)
-
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    module=r"^yfinance(\..*)?$",
-)
-
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    module=r"^yfinance(\..*)?$",
-)
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^yfinance(\..*)?$")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"^yfinance(\..*)?$")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"^yfinance(\..*)?$")
 
 import numpy as np
 import pandas as pd
@@ -78,46 +47,23 @@ DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Screen hourly long setups with a configurable 5%% swing target.",
+        description="Screen hourly long setups with confirmed and fresh-momentum patterns.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Core I/O
+    # Core I/O / data.
     parser.add_argument("--tickers-file", type=Path, default=None)
     parser.add_argument("--period", default="60d")
     parser.add_argument("--interval", default="60m")
     parser.add_argument("--include-prepost", action="store_true")
     parser.add_argument("--outdir", type=Path, default=Path("output"))
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument(
-        "--max-workers",
-        type=int,
-        default=4,
-        help="Concurrent Yahoo requests. Lower values reduce temporary provider failures.",
-    )
-    parser.add_argument(
-        "--min-completed-bars",
-        type=int,
-        default=60,
-        help=(
-            "Minimum fully completed hourly bars after excluding the newest in-progress bar. "
-            "60 is sufficient for a 50 EMA plus ATR/volume calculations."
-        ),
-    )
-    parser.add_argument(
-        "--download-retries",
-        type=int,
-        default=3,
-        help="How many times to retry a ticker when Yahoo returns empty/malformed hourly data.",
-    )
-    parser.add_argument(
-        "--retry-delay-seconds",
-        type=float,
-        default=1.0,
-        help="Delay between Yahoo retries.",
-    )
+    parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument("--min-completed-bars", type=int, default=60)
+    parser.add_argument("--download-retries", type=int, default=3)
+    parser.add_argument("--retry-delay-seconds", type=float, default=1.0)
 
-    # Existing score / risk / liquidity filters
+    # Global filters.
     parser.add_argument("--target-pct", type=float, default=5.0)
     parser.add_argument("--min-score", type=int, default=72)
     parser.add_argument("--max-risk-pct", type=float, default=3.25)
@@ -126,114 +72,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-hourly-dollar-volume", type=float, default=500_000)
     parser.add_argument("--min-rel-volume", type=float, default=0.85)
 
-    # NEW: resistance and candle gates
-    parser.add_argument(
-        "--allow-resistance-before-target",
-        action="store_true",
-        help=(
-            "Do not reject a candidate merely because a prior resistance level is "
-            "before the full 5%% target. The CSV will flag the resistance distance."
-        ),
-    )
-    parser.add_argument(
-        "--resistance-target-buffer-pct",
-        type=float,
-        default=0.50,
-        help=(
-            "When resistance clearance is enforced, allow target up to this percentage "
-            "above marked resistance. Default 0.50 matches the original behavior."
-        ),
-    )
-    parser.add_argument(
-        "--allow-neutral-candle",
-        action="store_true",
-        help=(
-            "Accept a near-flat/neutral latest candle instead of requiring a clearly "
-            "bullish confirmation candle. Use only for manual review."
-        ),
-    )
+    # Confirmation / resistance gates.
+    parser.add_argument("--allow-resistance-before-target", action="store_true")
+    parser.add_argument("--resistance-target-buffer-pct", type=float, default=0.50)
+    parser.add_argument("--allow-neutral-candle", action="store_true")
 
-    # NEW: uptrend-pullback gates
-    parser.add_argument(
-        "--pullback-touch-pct",
-        type=float,
-        default=1.20,
-        help="How far below/above the 20 EMA a recent low can be and still count as a pullback.",
-    )
-    parser.add_argument(
-        "--pullback-max-ema20-distance-pct",
-        type=float,
-        default=3.00,
-        help="Maximum current distance above the 20 EMA for an uptrend pullback entry.",
-    )
-    parser.add_argument(
-        "--pullback-volume-multiplier",
-        type=float,
-        default=1.10,
-        help="Maximum pullback volume versus prior 20-hour average; higher is more relaxed.",
-    )
-    parser.add_argument(
-        "--allow-uptrend-continuation",
-        action="store_true",
-        help=(
-            "Adds UPTREND_CONTINUATION as an optional entry pattern: price stays above "
-            "rising EMAs but did not make a textbook 20-EMA pullback. Lower quality than pullback."
-        ),
-    )
+    # Existing confirmed-pattern controls.
+    parser.add_argument("--pullback-touch-pct", type=float, default=1.20)
+    parser.add_argument("--pullback-max-ema20-distance-pct", type=float, default=3.00)
+    parser.add_argument("--pullback-volume-multiplier", type=float, default=1.10)
+    parser.add_argument("--allow-uptrend-continuation", action="store_true")
+    parser.add_argument("--breakout-event-volume-multiplier", type=float, default=1.25)
+    parser.add_argument("--breakout-retest-tolerance-pct", type=float, default=1.50)
+    parser.add_argument("--breakout-max-extension-pct", type=float, default=2.50)
+    parser.add_argument("--range-support-distance-pct", type=float, default=2.00)
+    parser.add_argument("--reversal-higher-low-pct", type=float, default=0.60)
+    parser.add_argument("--reversal-structure-break-pct", type=float, default=0.10)
+    parser.add_argument("--reversal-min-rel-volume", type=float, default=1.00)
+    parser.add_argument("--allow-reversal-below-ema50", action="store_true")
 
-    # NEW: breakout / range gates
-    parser.add_argument(
-        "--breakout-event-volume-multiplier",
-        type=float,
-        default=1.25,
-        help="Volume multiple required on the earlier breakout candle; lower is more relaxed.",
-    )
-    parser.add_argument(
-        "--breakout-retest-tolerance-pct",
-        type=float,
-        default=1.50,
-        help="How far price may fall below breakout level during retest and still count as holding.",
-    )
-    parser.add_argument(
-        "--breakout-max-extension-pct",
-        type=float,
-        default=2.50,
-        help="Maximum distance above breakout level permitted for a retest entry.",
-    )
-    parser.add_argument(
-        "--range-support-distance-pct",
-        type=float,
-        default=2.00,
-        help="How close price must be to range support for RANGE_SUPPORT_BOUNCE.",
-    )
+    # Earlier, current-hour momentum patterns. Disabled by default so CLI behavior
+    # remains confirmation-oriented unless a caller deliberately enables them.
+    parser.add_argument("--allow-fresh-breakout", action="store_true")
+    parser.add_argument("--fresh-breakout-lookback-bars", type=int, default=20)
+    parser.add_argument("--fresh-breakout-min-rel-volume", type=float, default=1.00)
+    parser.add_argument("--fresh-breakout-max-extension-pct", type=float, default=1.50)
+    parser.add_argument("--allow-early-recovery", action="store_true")
+    parser.add_argument("--early-recovery-lookback-bars", type=int, default=6)
+    parser.add_argument("--early-recovery-min-rel-volume", type=float, default=0.90)
+    parser.add_argument("--early-recovery-max-ema20-distance-pct", type=float, default=1.75)
+    parser.add_argument("--early-recovery-structure-break-pct", type=float, default=0.10)
 
-    # NEW: reversal gates
-    parser.add_argument(
-        "--reversal-higher-low-pct",
-        type=float,
-        default=0.60,
-        help="Minimum percentage by which recent low must exceed prior swing low.",
-    )
-    parser.add_argument(
-        "--reversal-structure-break-pct",
-        type=float,
-        default=0.10,
-        help="Required percentage break above local structure high; 0 permits an equal/high retest.",
-    )
-    parser.add_argument(
-        "--reversal-min-rel-volume",
-        type=float,
-        default=1.00,
-        help="Relative volume required for a reversal confirmation.",
-    )
-    parser.add_argument(
-        "--allow-reversal-below-ema50",
-        action="store_true",
-        help=(
-            "Allow early reversal candidates that reclaimed the 20 EMA but are still just below "
-            "the 50 EMA. This does NOT allow ordinary downtrend entries."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -254,31 +123,20 @@ def load_tickers(path: Path | None) -> list[str]:
             if ticker and ticker not in seen:
                 seen.add(ticker)
                 result.append(ticker)
+
     if not result:
         raise SystemExit(f"No ticker symbols found in {selected}")
     return result
 
 
 def _field_positions(data: pd.DataFrame, field: str) -> list[int]:
-    """
-    Find all physical columns corresponding to a Yahoo OHLCV field.
-
-    yfinance may return:
-      - simple columns: Open, High, Low, Close, Volume
-      - MultiIndex:    (Price, Ticker)
-      - MultiIndex:    (Ticker, Price)
-      - duplicate flat columns after a library-version conversion
-
-    We deliberately select by physical column position, not data["Close"], so
-    duplicate labels cannot turn Close into a DataFrame.
-    """
+    """Find physical columns matching an OHLCV field in flat or MultiIndex data."""
     wanted = field.upper()
     positions: list[int] = []
 
     if isinstance(data.columns, pd.MultiIndex):
         for index, label in enumerate(data.columns):
-            parts = {str(part).upper() for part in label}
-            if wanted in parts:
+            if wanted in {str(part).upper() for part in label}:
                 positions.append(index)
     else:
         for index, label in enumerate(data.columns):
@@ -289,10 +147,7 @@ def _field_positions(data: pd.DataFrame, field: str) -> list[int]:
 
 
 def _select_field_series(data: pd.DataFrame, field: str, ticker: str) -> pd.Series:
-    """
-    Return exactly one numeric Series for an OHLCV field, even if Yahoo returns
-    ambiguous MultiIndex/duplicate columns.
-    """
+    """Return exactly one numeric series even when Yahoo yields duplicate labels."""
     positions = _field_positions(data, field)
     if not positions:
         raise ValueError(f"Missing {field} column in Yahoo response")
@@ -308,11 +163,8 @@ def _select_field_series(data: pd.DataFrame, field: str, ticker: str) -> pd.Seri
         )
         ticker_match = int(ticker_upper in label_parts)
         series = pd.to_numeric(data.iloc[:, position], errors="coerce")
-        non_null = int(series.notna().sum())
-        return ticker_match, non_null
+        return ticker_match, int(series.notna().sum())
 
-    # Prefer the column that explicitly includes the requested ticker. Otherwise
-    # choose the populated candidate with the most actual numeric observations.
     chosen = max(positions, key=quality)
     series = pd.to_numeric(data.iloc[:, chosen], errors="coerce")
     series.name = field
@@ -320,17 +172,12 @@ def _select_field_series(data: pd.DataFrame, field: str, ticker: str) -> pd.Seri
 
 
 def normalize_columns(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Normalize yfinance output to a single, guaranteed one-dimensional OHLCV table.
-    This fixes errors such as:
-      'Cannot set a DataFrame with multiple columns to the single column EMA20'.
-    """
+    """Normalize Yahoo output into a one-dimensional OHLCV table."""
     if data is None or data.empty:
         raise ValueError("Empty Yahoo response")
 
     required = ["Open", "High", "Low", "Close", "Volume"]
     normalized = pd.DataFrame(index=data.index)
-
     for field in required:
         normalized[field] = _select_field_series(data, field, ticker)
 
@@ -348,10 +195,6 @@ def _download_once(
     interval: str,
     include_prepost: bool,
 ) -> pd.DataFrame:
-    """
-    yfinance versions differ on multi_level_index support. Prefer flat columns
-    when available, but safely fall back to standard output.
-    """
     common = dict(
         tickers=ticker,
         period=period,
@@ -375,10 +218,6 @@ def _history_fallback(
     interval: str,
     include_prepost: bool,
 ) -> pd.DataFrame:
-    """
-    Some Yahoo symbols intermittently fail through yf.download but work through
-    Ticker.history. Use 1h as Yahoo's equivalent for 60m in this fallback.
-    """
     fallback_interval = "1h" if interval == "60m" else interval
     return yf.Ticker(ticker).history(
         period=period,
@@ -387,6 +226,43 @@ def _history_fallback(
         prepost=include_prepost,
         raise_errors=False,
     )
+
+
+def _interval_duration(interval: str) -> pd.Timedelta:
+    if interval == "60m":
+        return pd.Timedelta(minutes=60)
+    if interval.endswith("m"):
+        return pd.Timedelta(minutes=int(interval[:-1]))
+    if interval.endswith("h"):
+        return pd.Timedelta(hours=int(interval[:-1]))
+    return pd.Timedelta(minutes=60)
+
+
+def completed_bars_only(data: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """
+    Drop zero-volume placeholders and remove the latest bar only when it is still open.
+
+    The prior implementation removed the final nonzero bar unconditionally. That made
+    after-close scans stale by an additional hour. Yahoo labels intraday bars by their
+    start timestamp, so a bar is considered complete after its full interval plus a
+    two-minute delivery grace period.
+    """
+    cleaned = data.loc[data["Volume"].fillna(0).gt(0)].copy()
+    if cleaned.empty:
+        return cleaned
+
+    last_timestamp = pd.Timestamp(cleaned.index[-1])
+    duration = _interval_duration(interval)
+
+    if last_timestamp.tzinfo is None:
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    else:
+        now = pd.Timestamp.now(tz=last_timestamp.tz)
+
+    if now < last_timestamp + duration + pd.Timedelta(minutes=2):
+        cleaned = cleaned.iloc[:-1].copy()
+
+    return cleaned
 
 
 def fetch_hourly(
@@ -398,69 +274,37 @@ def fetch_hourly(
     download_retries: int,
     retry_delay_seconds: float,
 ) -> tuple[str, pd.DataFrame | None, str | None]:
-    """
-    Download with retries plus a history fallback. A ticker remains in errors only
-    if Yahoo still does not provide enough valid hourly OHLCV data.
-    """
+    """Download hourly data with retries, fallback, and completed-candle handling."""
     attempts: list[str] = []
     retries = max(1, int(download_retries))
 
     for attempt in range(1, retries + 1):
-        # First try the standard downloader.
-        try:
-            raw = _download_once(ticker, period, interval, include_prepost)
-            if raw is not None and not raw.empty:
-                data = normalize_columns(raw, ticker)
+        for source, fetcher in (
+            ("download", _download_once),
+            ("history fallback", _history_fallback),
+        ):
+            try:
+                raw = fetcher(ticker, period, interval, include_prepost)
+                if raw is None or raw.empty:
+                    attempts.append(f"{source} {attempt}: empty response")
+                    continue
 
-                # Yahoo can append zero-volume after-hours / placeholder candles.
-                # Remove them before calculating indicators and relative volume.
-                data = data.loc[data["Volume"].fillna(0).gt(0)].copy()
-                
-                # Ignore the newest valid candle because it may still be forming.
-                if len(data) > 1:
-                    data = data.iloc[:-1].copy()
+                data = completed_bars_only(normalize_columns(raw, ticker), interval)
                 if len(data) >= min_completed_bars:
                     return ticker, data, None
+
                 attempts.append(
-                    f"download attempt {attempt}: only {len(data)} completed bars "
+                    f"{source} {attempt}: only {len(data)} completed bars "
                     f"(need {min_completed_bars})"
                 )
-            else:
-                attempts.append(f"download attempt {attempt}: empty response")
-        except Exception as exc:
-            attempts.append(f"download attempt {attempt}: {type(exc).__name__}: {exc}")
-
-        # Then try Ticker.history. This particularly helps symbols where yfinance
-        # returns an unusual column schema or transient empty download result.
-        try:
-            raw = _history_fallback(ticker, period, interval, include_prepost)
-            if raw is not None and not raw.empty:
-                data = normalize_columns(raw, ticker)
-
-                # Yahoo can append zero-volume after-hours / placeholder candles.
-                # Remove them before calculating indicators and relative volume.
-                data = data.loc[data["Volume"].fillna(0).gt(0)].copy()
-                
-                # Ignore the newest valid candle because it may still be forming.
-                if len(data) > 1:
-                    data = data.iloc[:-1].copy()
-                if len(data) >= min_completed_bars:
-                    return ticker, data, None
-                attempts.append(
-                    f"history fallback {attempt}: only {len(data)} completed bars "
-                    f"(need {min_completed_bars})"
-                )
-            else:
-                attempts.append(f"history fallback {attempt}: empty response")
-        except Exception as exc:
-            attempts.append(
-                f"history fallback {attempt}: {type(exc).__name__}: {exc}"
-            )
+            except Exception as exc:
+                attempts.append(f"{source} {attempt}: {type(exc).__name__}: {exc}")
 
         if attempt < retries:
             time.sleep(max(0.0, retry_delay_seconds))
 
     return ticker, None, " | ".join(attempts[-4:])
+
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -477,11 +321,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     ).max(axis=1)
     out["ATR14"] = true_range.rolling(14).mean()
-
     out["AvgVol20"] = out["Volume"].rolling(20).mean()
     out["RelVol20"] = out["Volume"] / out["AvgVol20"].replace(0, np.nan)
     out["AvgDollarVol20"] = (out["Close"] * out["Volume"]).rolling(20).mean()
-
     out["EMA20Slope5"] = out["EMA20"] - out["EMA20"].shift(5)
     out["EMA50Slope8"] = out["EMA50"] - out["EMA50"].shift(8)
     return out.dropna().copy()
@@ -512,7 +354,7 @@ def bearish_confirmation(bar: pd.Series) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# All six chart states
+# Chart-state helpers.
 # ---------------------------------------------------------------------------
 
 def detect_uptrend(df: pd.DataFrame) -> bool:
@@ -556,7 +398,7 @@ def breakout_level(df: pd.DataFrame, args: argparse.Namespace) -> tuple[bool, fl
         (recent["Close"] > resistance * 1.002)
         & (recent["Volume"] >= recent["AvgVol20"] * args.breakout_event_volume_multiplier)
     ]
-    return (not breakout_bars.empty), resistance
+    return not breakout_bars.empty, resistance
 
 
 def breakdown_level(df: pd.DataFrame) -> tuple[bool, float]:
@@ -590,12 +432,8 @@ def reversal_structure(
         before.iloc[-1]["Close"] < before.iloc[-1]["EMA50"]
         or before.iloc[-1]["EMA20"] < before.iloc[-1]["EMA50"]
     )
-    ema_ok = (
-        bar["Close"] > bar["EMA20"]
-        and (
-            bar["Close"] > bar["EMA50"]
-            or args.allow_reversal_below_ema50
-        )
+    ema_ok = bar["Close"] > bar["EMA20"] and (
+        bar["Close"] > bar["EMA50"] or args.allow_reversal_below_ema50
     )
     confirmed = bool(
         was_weak
@@ -609,13 +447,22 @@ def reversal_structure(
     return confirmed, higher_low, structure_high
 
 
+def nearest_overhead_resistance(df: pd.DataFrame, entry: float, lookback: int = 40) -> float:
+    """Return the nearest recent high genuinely above entry, if one exists."""
+    window = df.iloc[-(lookback + 1):-1]
+    if window.empty:
+        return math.nan
+
+    overhead = window.loc[window["High"] > entry * 1.001, "High"]
+    return float(overhead.min()) if not overhead.empty else math.nan
+
+
 def target_clear_of_resistance(
     entry: float,
     target_pct: float,
     resistance: float,
     args: argparse.Namespace,
 ) -> bool:
-    """Keep original behavior unless user deliberately allows a resistance before target."""
     if args.allow_resistance_before_target or not np.isfinite(resistance):
         return True
     target = entry * (1.0 + target_pct / 100.0)
@@ -634,6 +481,8 @@ def make_candidate(
     support: float,
     resistance: float,
     reason: str,
+    signal_phase: str = "Confirmed",
+    signal_age_bars: int | None = None,
 ) -> dict[str, Any] | None:
     if not np.isfinite(stop) or stop >= entry:
         return None
@@ -646,6 +495,8 @@ def make_candidate(
     return {
         "Ticker": ticker,
         "Pattern": pattern,
+        "SignalPhase": signal_phase,
+        "SignalAgeBars": signal_age_bars if signal_age_bars is not None else math.nan,
         "Action": "LONG_ENTRY_REVIEW",
         "Score": int(score),
         "LastCompletedHourlyBar": str(bar.name),
@@ -672,7 +523,158 @@ def make_candidate(
 
 
 # ---------------------------------------------------------------------------
-# Potential long-entry patterns. Only these can go to good_entries.csv
+# Earlier, current-hour signals.
+# ---------------------------------------------------------------------------
+
+def try_fresh_breakout(
+    df: pd.DataFrame,
+    ticker: str,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Surface the first completed hourly candle through a defined base high."""
+    if not args.allow_fresh_breakout:
+        return None
+
+    lookback = max(10, int(args.fresh_breakout_lookback_bars))
+    base = df.iloc[-(lookback + 1):-1]
+    if len(base) < lookback:
+        return None
+
+    bar = df.iloc[-1]
+    entry = float(bar["Close"])
+    base_high = float(base["High"].max())
+    extension_pct = pct(entry, base_high)
+    recent_lows = df.iloc[-3:]["Low"]
+    support = float(recent_lows.min())
+    resistance = nearest_overhead_resistance(df, entry, lookback=max(40, lookback))
+
+    candle_range = max(float(bar["High"] - bar["Low"]), 1e-9)
+    close_location = float((bar["Close"] - bar["Low"]) / candle_range)
+    ema_turning = float(bar["EMA20"]) >= float(df.iloc[-3]["EMA20"])
+    price_above_ema20 = bool(bar["Close"] > bar["EMA20"])
+    target_room_ok = target_clear_of_resistance(entry, args.target_pct, resistance, args)
+
+    is_fresh = bool(
+        entry > base_high * 1.001
+        and 0.10 <= extension_pct <= args.fresh_breakout_max_extension_pct
+        and close_location >= 0.65
+        and bar["RelVol20"] >= args.fresh_breakout_min_rel_volume
+        and price_above_ema20
+        and ema_turning
+        and target_room_ok
+    )
+    if not is_fresh:
+        return None
+
+    stop = min(
+        support - 0.10 * bar["ATR14"],
+        base_high - 0.30 * bar["ATR14"],
+    )
+    score = 58
+    score += 12 if bar["RelVol20"] >= 1.35 else 0
+    score += 8 if bar["Close"] > bar["EMA50"] else 0
+    score += 7 if extension_pct <= 0.75 else 0
+    score += 5 if bar["Close"] > df.iloc[-2]["High"] else 0
+
+    return make_candidate(
+        ticker=ticker,
+        pattern="FRESH_BREAKOUT",
+        score=score,
+        bar=bar,
+        entry=entry,
+        stop=float(stop),
+        target_pct=args.target_pct,
+        support=support,
+        resistance=resistance,
+        reason=(
+            "Latest completed hourly candle broke the recent base high with a close "
+            "near its high, volume confirmation, and limited extension."
+        ),
+        signal_phase="Fresh current-hour breakout",
+        signal_age_bars=0,
+    )
+
+
+def try_early_recovery(
+    df: pd.DataFrame,
+    ticker: str,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Find an early reclaim rather than waiting for the full EMA50 trend confirmation."""
+    if not args.allow_early_recovery:
+        return None
+
+    lookback = max(5, int(args.early_recovery_lookback_bars))
+    recent = df.iloc[-(lookback + 1):-1]
+    if len(recent) < lookback:
+        return None
+
+    bar = df.iloc[-1]
+    previous = df.iloc[-2]
+    entry = float(bar["Close"])
+    support = float(df.iloc[-4:]["Low"].min())
+    short_structure_high = float(recent["High"].max())
+    resistance = nearest_overhead_resistance(df, entry, lookback=40)
+
+    distance_to_ema20 = pct(entry, float(bar["EMA20"]))
+    recent_weakness = bool((recent["Close"] <= recent["EMA20"] * 1.005).any())
+    reclaimed_ema20 = bool(
+        previous["Close"] <= previous["EMA20"] * 1.005
+        and bar["Close"] > bar["EMA20"] * 1.001
+    )
+    short_structure_break = bool(
+        bar["Close"] >= short_structure_high
+        * (1.0 + args.early_recovery_structure_break_pct / 100.0)
+    )
+    ema_not_falling_hard = bool(
+        bar["EMA20"] >= df.iloc[-3]["EMA20"] - 0.10 * bar["ATR14"]
+    )
+    target_room_ok = target_clear_of_resistance(entry, args.target_pct, resistance, args)
+
+    is_early_recovery = bool(
+        recent_weakness
+        and bullish_confirmation(bar, False)
+        and 0.0 <= distance_to_ema20 <= args.early_recovery_max_ema20_distance_pct
+        and (reclaimed_ema20 or short_structure_break)
+        and ema_not_falling_hard
+        and bar["RelVol20"] >= args.early_recovery_min_rel_volume
+        and target_room_ok
+    )
+    if not is_early_recovery:
+        return None
+
+    stop = min(
+        support - 0.10 * bar["ATR14"],
+        bar["EMA20"] - 0.45 * bar["ATR14"],
+    )
+    score = 55
+    score += 12 if bar["RelVol20"] >= 1.25 else 0
+    score += 8 if short_structure_break else 0
+    score += 7 if bar["Close"] > bar["EMA50"] else 0
+    score += 5 if reclaimed_ema20 else 0
+    score += 5 if distance_to_ema20 <= 1.00 else 0
+
+    return make_candidate(
+        ticker=ticker,
+        pattern="EARLY_RECOVERY",
+        score=score,
+        bar=bar,
+        entry=entry,
+        stop=float(stop),
+        target_pct=args.target_pct,
+        support=support,
+        resistance=resistance,
+        reason=(
+            "Recent weakness is reclaiming the 20 EMA or breaking short structure "
+            "on the latest completed hourly candle before a full mature trend forms."
+        ),
+        signal_phase="Fresh current-hour recovery",
+        signal_age_bars=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Existing confirmed long patterns.
 # ---------------------------------------------------------------------------
 
 def try_uptrend_pullback(
@@ -725,10 +727,6 @@ def try_uptrend_continuation(
     ticker: str,
     args: argparse.Namespace,
 ) -> dict[str, Any] | None:
-    """
-    Optional. Designed to surface an uptrend that did not make a textbook pullback.
-    It is clearly labeled in output and is disabled unless --allow-uptrend-continuation.
-    """
     if not args.allow_uptrend_continuation or not detect_uptrend(df):
         return None
 
@@ -740,11 +738,11 @@ def try_uptrend_continuation(
     resistance = float(prior40["High"].max())
     distance = pct(entry, bar["EMA20"])
 
-    not_too_extended = 0.0 <= distance <= args.pullback_max_ema20_distance_pct
-    confirmation = bullish_confirmation(bar, args.allow_neutral_candle)
-    target_room_ok = target_clear_of_resistance(entry, args.target_pct, resistance, args)
-
-    if not (not_too_extended and confirmation and target_room_ok):
+    if not (
+        0.0 <= distance <= args.pullback_max_ema20_distance_pct
+        and bullish_confirmation(bar, args.allow_neutral_candle)
+        and target_clear_of_resistance(entry, args.target_pct, resistance, args)
+    ):
         return None
 
     stop = min(
@@ -849,8 +847,7 @@ def try_reversal_confirm(
     prior40 = df.iloc[-61:-1]
     entry = float(bar["Close"])
     resistance = float(prior40["High"].max())
-    target_room_ok = target_clear_of_resistance(entry, args.target_pct, resistance, args)
-    if not target_room_ok:
+    if not target_clear_of_resistance(entry, args.target_pct, resistance, args):
         return None
 
     stop = min(
@@ -921,7 +918,7 @@ def classify_ticker(
         "Reason": "",
     }
 
-    # Safeguards that remain true even in relaxed mode.
+    # Safeguards apply to both fresh and confirmed profiles.
     if bar["Close"] < args.min_price:
         debug["Reason"] = f"Below minimum price (${args.min_price:.2f})"
         return None, debug
@@ -939,6 +936,8 @@ def classify_ticker(
         return None, debug
 
     choices = [
+        try_fresh_breakout(df, ticker, args),
+        try_early_recovery(df, ticker, args),
         try_breakout_retest(df, ticker, args),
         try_uptrend_pullback(df, ticker, args),
         try_uptrend_continuation(df, ticker, args),
@@ -962,19 +961,26 @@ def classify_ticker(
         debug["Reason"] = "No complete long-entry setup passed active filters"
         return None, debug
 
+    # Fresh signals come first in the tie-break only when their score is equal;
+    # this preserves a higher-quality confirmed setup when it is objectively stronger.
     selected = max(
         candidates,
-        key=lambda row: (row["Score"], row["RewardRisk_to_Target"], row["RelVol20"]),
+        key=lambda row: (
+            row["Score"],
+            row["RewardRisk_to_Target"],
+            row["RelVol20"],
+            -int(row.get("SignalAgeBars", 99) if np.isfinite(row.get("SignalAgeBars", math.nan)) else 99),
+        ),
     )
     debug["Reason"] = f"Selected {selected['Pattern']}"
     return selected, debug
 
 
 def write_csv(rows: list[dict[str, Any]], path: Path, columns: list[str] | None = None) -> None:
-    df = pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
     if columns is not None:
-        df = df.reindex(columns=columns)
-    df.to_csv(path, index=False)
+        frame = frame.reindex(columns=columns)
+    frame.to_csv(path, index=False)
 
 
 def main() -> None:
@@ -995,14 +1001,10 @@ def main() -> None:
         f"avg hourly $vol>=${args.min_hourly_dollar_volume:,.0f}"
     )
     print(
-        "Relaxations: "
-        f"target-resistance={'ALLOW' if args.allow_resistance_before_target else 'REQUIRE'}; "
-        f"neutral-candle={'ALLOW' if args.allow_neutral_candle else 'REQUIRE BULLISH'}; "
+        "Signals: "
+        f"fresh-breakout={'ON' if args.allow_fresh_breakout else 'OFF'}; "
+        f"early-recovery={'ON' if args.allow_early_recovery else 'OFF'}; "
         f"continuation={'ON' if args.allow_uptrend_continuation else 'OFF'}"
-    )
-    print(
-        f"Data handling: min completed bars={args.min_completed_bars}; "
-        f"Yahoo retries={args.download_retries}; workers={args.max_workers}"
     )
 
     downloaded: dict[str, pd.DataFrame] = {}
@@ -1051,11 +1053,10 @@ def main() -> None:
     )
 
     result_columns = [
-        "Ticker", "Pattern", "Action", "Score", "LastCompletedHourlyBar",
-        "Entry", "Stop", "Target_5pct", "Risk_pct", "RewardRisk_to_Target",
-        "Close", "EMA20", "EMA50", "Distance_to_EMA20_pct", "Distance_to_EMA50_pct",
-        "RelVol20", "AvgHourlyDollarVol20", "Support", "Resistance",
-        "ResistanceDistance_pct", "ResistanceBefore5pctTarget", "Reason",
+        "Ticker", "Pattern", "SignalPhase", "SignalAgeBars", "Action", "Score", "LastCompletedHourlyBar",
+        "Entry", "Stop", "Target_5pct", "Risk_pct", "RewardRisk_to_Target", "Close", "EMA20", "EMA50",
+        "Distance_to_EMA20_pct", "Distance_to_EMA50_pct", "RelVol20", "AvgHourlyDollarVol20", "Support",
+        "Resistance", "ResistanceDistance_pct", "ResistanceBefore5pctTarget", "Reason",
     ]
     output_file = args.outdir / "good_entries.csv"
     write_csv(good_entries, output_file, result_columns)
@@ -1071,9 +1072,9 @@ def main() -> None:
     else:
         display = pd.DataFrame(good_entries)[
             [
-                "Ticker", "Pattern", "Score", "Entry", "Stop", "Target_5pct",
-                "Risk_pct", "RewardRisk_to_Target", "RelVol20",
-                "ResistanceDistance_pct", "ResistanceBefore5pctTarget",
+                "Ticker", "Pattern", "SignalPhase", "Score", "Entry", "Stop", "Target_5pct",
+                "Risk_pct", "RewardRisk_to_Target", "RelVol20", "ResistanceDistance_pct",
+                "ResistanceBefore5pctTarget",
             ]
         ]
         print(display.to_string(index=False))
