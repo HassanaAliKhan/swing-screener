@@ -5,9 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 
 import swing_screener_6_patterns as scanner
 
@@ -21,6 +19,37 @@ st.set_page_config(
 
 
 PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
+    "Fresh momentum": {
+        "min_score": 60,
+        "max_risk_pct": 3.75,
+        "min_reward_risk": 1.25,
+        "min_rel_volume": 0.80,
+        "min_hourly_dollar_volume": 250_000,
+        "min_price": 3.00,
+        "pullback_touch_pct": 2.0,
+        "pullback_max_ema20_distance_pct": 2.0,
+        "pullback_volume_multiplier": 1.20,
+        "breakout_event_volume_multiplier": 1.10,
+        "breakout_retest_tolerance_pct": 2.0,
+        "breakout_max_extension_pct": 2.0,
+        "range_support_distance_pct": 2.0,
+        "reversal_higher_low_pct": 0.25,
+        "reversal_structure_break_pct": 0.10,
+        "reversal_min_rel_volume": 0.90,
+        "allow_resistance_before_target": False,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": False,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": True,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": True,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
+    },
     "Balanced": {
         "min_score": 58,
         "max_risk_pct": 4.5,
@@ -42,6 +71,15 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "allow_neutral_candle": False,
         "allow_reversal_below_ema50": False,
         "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
     },
     "Relaxed review": {
         "min_score": 52,
@@ -64,6 +102,15 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "allow_neutral_candle": True,
         "allow_reversal_below_ema50": True,
         "allow_uptrend_continuation": True,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
     },
     "Strict": {
         "min_score": 72,
@@ -86,27 +133,32 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "allow_neutral_candle": False,
         "allow_reversal_below_ema50": False,
         "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
     },
 }
 
 
 def default_watchlist() -> str:
-    """Read the current default watchlist shipped with the deployed app."""
     path = scanner.DEFAULT_WATCHLIST
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 def parse_watchlist(raw_text: str) -> list[str]:
-    """Parse one-ticker-per-line input, ignoring comments, commas, blanks, and duplicates."""
     tickers: list[str] = []
     seen: set[str] = set()
 
     for line in raw_text.splitlines():
-        line_without_comment = line.split("#", 1)[0].replace(",", " ").strip()
-
-        for token in line_without_comment.split():
-            ticker = token.strip().upper()
-
+        cleaned = line.split("#", 1)[0].replace(",", " ").strip()
+        for token in cleaned.split():
+            ticker = token.upper()
             if ticker and ticker not in seen:
                 seen.add(ticker)
                 tickers.append(ticker)
@@ -122,14 +174,10 @@ def build_args(
     custom_rel_volume: float,
     custom_min_score: int,
 ) -> SimpleNamespace:
-    """Build the scanner argument object expected by the backend."""
     settings = dict(PROFILE_SETTINGS[profile])
-
-    # User-visible controls override the selected profile defaults.
     settings["target_pct"] = float(target_pct)
     settings["min_rel_volume"] = float(custom_rel_volume)
     settings["min_score"] = int(custom_min_score)
-
     settings.update(
         {
             "period": "60d",
@@ -139,13 +187,9 @@ def build_args(
             "download_retries": 3,
             "retry_delay_seconds": 1.0,
             "max_workers": int(workers),
-
-            # Required by scanner.target_clear_of_resistance().
-            # Same default as the CLI backend.
             "resistance_target_buffer_pct": 0.50,
         }
     )
-
     return SimpleNamespace(**settings)
 
 
@@ -153,16 +197,7 @@ def scan_watchlist(
     tickers: list[str],
     args: SimpleNamespace,
     progress_callback,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
-    """
-    Run the backend screener.
-
-    Returns:
-      - Good long-entry candidates
-      - All classifications
-      - Yahoo/provider/data errors
-      - Raw hourly OHLCV data keyed by ticker for candidate charts
-    """
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     data_by_ticker: dict[str, pd.DataFrame] = {}
     errors: list[dict[str, str]] = []
     classifications: list[dict[str, Any]] = []
@@ -193,12 +228,7 @@ def scan_watchlist(
             completed += 1
 
             if frame is None:
-                errors.append(
-                    {
-                        "Ticker": ticker,
-                        "Error": error or "Unknown Yahoo data error",
-                    }
-                )
+                errors.append({"Ticker": ticker, "Error": error or "Unknown Yahoo data error"})
             else:
                 data_by_ticker[ticker] = frame
 
@@ -206,25 +236,19 @@ def scan_watchlist(
 
     for ticker in tickers:
         frame = data_by_ticker.get(ticker)
-
         if frame is None:
             continue
 
         try:
             candidate, debug = scanner.classify_ticker(ticker, frame, args)
             classifications.append(debug)
-
             if candidate is not None:
                 candidates.append(candidate)
-
         except Exception as exc:
             errors.append(
                 {
                     "Ticker": ticker,
-                    "Error": (
-                        f"Classification error: "
-                        f"{type(exc).__name__}: {exc}"
-                    ),
+                    "Error": f"Classification error: {type(exc).__name__}: {exc}",
                 }
             )
 
@@ -236,137 +260,41 @@ def scan_watchlist(
         ),
         reverse=True,
     )
-
     classifications.sort(key=lambda row: row.get("Ticker", ""))
     errors.sort(key=lambda row: row.get("Ticker", ""))
 
-    return (
-        pd.DataFrame(candidates),
-        pd.DataFrame(classifications),
-        pd.DataFrame(errors),
-        data_by_ticker,
-    )
+    return pd.DataFrame(candidates), pd.DataFrame(classifications), pd.DataFrame(errors)
 
 
 def dataframe_csv(df: pd.DataFrame) -> bytes:
-    """Create downloadable CSV bytes."""
     return df.to_csv(index=False).encode("utf-8")
-
-
-def candidate_chart(
-    ticker: str,
-    raw_data: pd.DataFrame,
-    candidate: dict[str, Any],
-) -> go.Figure:
-    """Create an interactive hourly candlestick chart for one screener candidate."""
-    data = scanner.add_indicators(raw_data).tail(80).copy()
-
-    figure = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.78, 0.22],
-        subplot_titles=(f"{ticker} — hourly setup", "Hourly volume"),
-    )
-
-    figure.add_trace(
-        go.Candlestick(
-            x=data.index,
-            open=data["Open"],
-            high=data["High"],
-            low=data["Low"],
-            close=data["Close"],
-            name="Hourly price",
-        ),
-        row=1,
-        col=1,
-    )
-
-    figure.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=data["EMA20"],
-            mode="lines",
-            name="EMA20",
-        ),
-        row=1,
-        col=1,
-    )
-
-    figure.add_trace(
-        go.Scatter(
-            x=data.index,
-            y=data["EMA50"],
-            mode="lines",
-            name="EMA50",
-        ),
-        row=1,
-        col=1,
-    )
-
-    figure.add_trace(
-        go.Bar(
-            x=data.index,
-            y=data["Volume"],
-            name="Volume",
-        ),
-        row=2,
-        col=1,
-    )
-
-    levels = [
-        ("Entry", candidate.get("Entry")),
-        ("Stop", candidate.get("Stop")),
-        ("Target", candidate.get("Target_5pct")),
-        ("Support", candidate.get("Support")),
-        ("Resistance", candidate.get("Resistance")),
-    ]
-
-    for label, level in levels:
-        if level is None or pd.isna(level):
-            continue
-
-        figure.add_hline(
-            y=float(level),
-            row=1,
-            col=1,
-            line_dash="dot",
-            annotation_text=f"{label}: ${float(level):.2f}",
-            annotation_position="right",
-        )
-
-    figure.update_layout(
-        height=680,
-        margin=dict(l=20, r=135, t=55, b=20),
-        xaxis_rangeslider_visible=False,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
-        ),
-        hovermode="x unified",
-    )
-
-    figure.update_yaxes(title_text="Price", row=1, col=1)
-    figure.update_yaxes(title_text="Volume", row=2, col=1)
-    figure.update_xaxes(showgrid=False)
-
-    return figure
 
 
 st.title("Hourly Swing Screener")
 st.caption(
-    "On-demand 60-minute chart scan. Output contains only potential long-entry "
-    "candidates using the selected swing framework."
+    "On-demand 60-minute scan. Fresh momentum finds the first completed-hour "
+    "breakout/reclaim; confirmed profiles wait for more trend proof."
 )
-
 
 if "watchlist_text" not in st.session_state:
     st.session_state.watchlist_text = default_watchlist()
 
+if "profile_select" not in st.session_state:
+    st.session_state.profile_select = "Fresh momentum"
+if "min_score_control" not in st.session_state:
+    st.session_state.min_score_control = int(PROFILE_SETTINGS["Fresh momentum"]["min_score"])
+if "min_rel_volume_control" not in st.session_state:
+    st.session_state.min_rel_volume_control = float(
+        PROFILE_SETTINGS["Fresh momentum"]["min_rel_volume"]
+    )
+
+def reset_profile_controls() -> None:
+    """Keep the visible score and volume controls aligned with the selected profile."""
+    selected = st.session_state.profile_select
+    st.session_state.min_score_control = int(PROFILE_SETTINGS[selected]["min_score"])
+    st.session_state.min_rel_volume_control = float(
+        PROFILE_SETTINGS[selected]["min_rel_volume"]
+    )
 
 with st.expander("Watchlist and scan settings", expanded=False):
     if st.button("Reload saved watchlist from GitHub"):
@@ -377,31 +305,24 @@ with st.expander("Watchlist and scan settings", expanded=False):
         "Watchlist",
         key="watchlist_text",
         height=250,
-        help=(
-            "One symbol per line. Blank lines and # comments are ignored. "
-            "Changes apply only to this browser session."
-        ),
+        help="One symbol per line. Blank lines and # comments are ignored. Changes apply only to this browser session.",
     )
-
     st.caption(
-        "To permanently change the default list, edit `watchlist.txt` "
-        "in the GitHub repository and commit it."
+        "To permanently change the default list, edit `watchlist.txt` in the GitHub repository and commit it."
     )
 
     controls_1, controls_2, controls_3 = st.columns(3)
-
     with controls_1:
         profile = st.selectbox(
             "Scan profile",
-            options=["Balanced", "Relaxed review", "Strict"],
-            index=0,
+            options=["Fresh momentum", "Balanced", "Relaxed review", "Strict"],
+            key="profile_select",
+            on_change=reset_profile_controls,
             help=(
-                "Balanced is the recommended default. Relaxed review produces "
-                "more charts for manual inspection. Strict produces fewer, "
-                "tighter setups."
+                "Fresh momentum finds the earliest current-hour breakout/reclaim. "
+                "It uses stronger volume and tighter extension limits because early signals can fail."
             ),
         )
-
     with controls_2:
         target_pct = st.number_input(
             "Profit target (%)",
@@ -410,65 +331,48 @@ with st.expander("Watchlist and scan settings", expanded=False):
             value=5.0,
             step=0.5,
         )
-
     with controls_3:
-        include_prepost = st.checkbox(
-            "Include premarket / after-hours",
-            value=True,
-        )
+        include_prepost = st.checkbox("Include premarket / after-hours", value=True)
 
-    baseline = PROFILE_SETTINGS[profile]
     controls_4, controls_5, controls_6 = st.columns(3)
-
     with controls_4:
         min_score = st.slider(
             "Minimum setup score",
             min_value=45,
             max_value=90,
-            value=int(baseline["min_score"]),
             step=1,
+            key="min_score_control",
         )
-
     with controls_5:
         min_rel_volume = st.slider(
             "Minimum relative volume",
             min_value=0.20,
             max_value=1.50,
-            value=float(baseline["min_rel_volume"]),
             step=0.05,
+            key="min_rel_volume_control",
         )
-
     with controls_6:
         workers = st.select_slider(
             "Yahoo request concurrency",
             options=[1, 2, 3, 4],
             value=3,
-            help=(
-                "Use 1–2 if Yahoo temporarily returns errors. "
-                "Higher is faster but can be less reliable."
-            ),
+            help="Use 1–2 if Yahoo temporarily returns errors. Higher is faster but can be less reliable.",
         )
 
-    show_debug = st.checkbox(
-        "Show classifications and data errors after scan",
-        value=True,
-    )
+    show_debug = st.checkbox("Show classifications and data errors after scan", value=True)
 
+    if profile == "Fresh momentum":
+        st.caption(
+            "Fresh momentum only accepts signals from the latest completed hourly bar. "
+            "It is designed for idea generation, not automatic orders."
+        )
 
 tickers = parse_watchlist(st.session_state.watchlist_text)
-
 status_left, status_right = st.columns([3, 1])
-
 with status_left:
     st.write(f"**{len(tickers)} unique tickers loaded**")
-
 with status_right:
-    run_clicked = st.button(
-        "Run scan",
-        type="primary",
-        use_container_width=True,
-    )
-
+    run_clicked = st.button("Run scan", type="primary", use_container_width=True)
 
 if run_clicked:
     if not tickers:
@@ -495,7 +399,7 @@ if run_clicked:
         last_ticker.caption(f"Latest completed data request: {ticker}")
 
     with st.spinner("Scanning completed hourly candles…"):
-        good_entries, classifications, errors, price_data = scan_watchlist(
+        good_entries, classifications, errors = scan_watchlist(
             tickers,
             args,
             update_progress,
@@ -507,21 +411,19 @@ if run_clicked:
     st.session_state.last_good_entries = good_entries
     st.session_state.last_classifications = classifications
     st.session_state.last_errors = errors
-    st.session_state.last_price_data = price_data
     st.session_state.last_profile = profile
     st.session_state.last_target_pct = target_pct
     st.session_state.last_show_debug = show_debug
-
 
 if "last_good_entries" not in st.session_state:
     st.info("Choose settings, then tap **Run scan**.")
     st.stop()
 
-
 good_entries: pd.DataFrame = st.session_state.last_good_entries
 classifications: pd.DataFrame = st.session_state.last_classifications
 errors: pd.DataFrame = st.session_state.last_errors
 target_pct: float = st.session_state.last_target_pct
+profile: str = st.session_state.last_profile
 
 metric_1, metric_2, metric_3 = st.columns(3)
 metric_1.metric("Potential long entries", len(good_entries))
@@ -532,14 +434,14 @@ st.subheader("Good long-entry candidates")
 
 if good_entries.empty:
     st.warning(
-        "No names passed the selected rules. This is a normal result; "
-        "do not force trades. Use **Relaxed review** only to create a "
-        "broader manual-review list."
+        "No names passed the selected rules. This is normal; do not force trades. "
+        "Use Fresh momentum for early movement ideas and Balanced/Strict for confirmation."
     )
 else:
     display_columns = [
         "Ticker",
         "Pattern",
+        "SignalPhase",
         "Score",
         "LastCompletedHourlyBar",
         "Entry",
@@ -551,12 +453,7 @@ else:
         "ResistanceDistance_pct",
         "ResistanceBefore5pctTarget",
     ]
-
-    available_columns = [
-        column
-        for column in display_columns
-        if column in good_entries.columns
-    ]
+    available_columns = [column for column in display_columns if column in good_entries.columns]
 
     st.dataframe(
         good_entries[available_columns],
@@ -570,9 +467,7 @@ else:
             "Risk_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "RewardRisk_to_Target": st.column_config.NumberColumn(format="%.2f"),
             "RelVol20": st.column_config.NumberColumn(format="%.2f×"),
-            "ResistanceDistance_pct": st.column_config.NumberColumn(
-                format="%.2f%%"
-            ),
+            "ResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
 
@@ -584,72 +479,25 @@ else:
         use_container_width=True,
     )
 
-    st.subheader("Candidate chart")
-
-    chart_tickers = good_entries["Ticker"].dropna().tolist()
-
-    selected_chart_ticker = st.selectbox(
-        "Choose a candidate to inspect",
-        options=chart_tickers,
-        key="selected_candidate_chart",
-    )
-
-    selected_row = good_entries.loc[
-        good_entries["Ticker"] == selected_chart_ticker
-    ].iloc[0].to_dict()
-
-    price_data = st.session_state.get("last_price_data", {})
-    raw_chart_data = price_data.get(selected_chart_ticker)
-
-    if raw_chart_data is None or raw_chart_data.empty:
-        st.warning(
-            f"No hourly chart data is available for {selected_chart_ticker}."
-        )
-    else:
-        st.caption(
-            f"Pattern: **{selected_row.get('Pattern')}** · "
-            f"Last completed bar: `{selected_row.get('LastCompletedHourlyBar')}`"
-        )
-
-        st.plotly_chart(
-            candidate_chart(
-                selected_chart_ticker,
-                raw_chart_data,
-                selected_row,
-            ),
-            use_container_width=True,
-            config={
-                "displaylogo": False,
-                "scrollZoom": True,
-            },
-        )
-
-    with st.expander("How to read these results", expanded=False):
+    with st.expander("How to read Fresh momentum", expanded=False):
         st.markdown(
             f"""
-- **LastCompletedHourlyBar** shows how fresh the scan data is.
-- **Entry** is the last fully completed hourly candle close, not a command to market-buy.
-- **Stop** is the structural invalidation point for that pattern.
-- **Target** is Entry × **{target_pct:.1f}%**.
-- **Reward/Risk** is the potential target reward divided by the entry-to-stop risk.
-- **RelVol20** above `1.0×` means the final completed hour traded more volume than the 20-hour average.
-- **ResistanceBefore5pctTarget = True** means a marked resistance level appears before the full target.
-- Every result still needs a live-price check, daily-chart resistance check, and earnings/news check before an order.
+- **FRESH_BREAKOUT** = the latest completed hour moved through a defined base high; it is not a retest setup.
+- **EARLY_RECOVERY** = the latest completed hour reclaimed the 20 EMA or broke short structure after recent weakness.
+- **SignalPhase** tells you whether the setup is fresh on the current completed hourly bar or confirmed after more trend proof.
+- **Entry** is the prior completed candle close; it is not a market order instruction.
+- **Stop** is the proposed invalidation level. **Target** is Entry × **{target_pct:.1f}%**.
+- Fresh signals use tighter extension and volume rules, but they are naturally less confirmed and may fail more often than mature trend setups.
+- Check current price, the daily chart, earnings/news, and liquidity before acting.
 """
         )
-
 
 if st.session_state.last_show_debug:
     with st.expander("All classifications", expanded=False):
         if classifications.empty:
             st.info("No ticker classifications available.")
         else:
-            st.dataframe(
-                classifications,
-                use_container_width=True,
-                hide_index=True,
-            )
-
+            st.dataframe(classifications, use_container_width=True, hide_index=True)
             st.download_button(
                 "Download classifications CSV",
                 data=dataframe_csv(classifications),
@@ -662,12 +510,7 @@ if st.session_state.last_show_debug:
         if errors.empty:
             st.success("No provider/data errors.")
         else:
-            st.dataframe(
-                errors,
-                use_container_width=True,
-                hide_index=True,
-            )
-
+            st.dataframe(errors, use_container_width=True, hide_index=True)
             st.download_button(
                 "Download errors CSV",
                 data=dataframe_csv(errors),
