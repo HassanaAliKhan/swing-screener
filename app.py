@@ -5,12 +5,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
-import streamlit as st
-
-import swing_screener_6_patterns as scanner
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
 
+import swing_screener_6_patterns as scanner
 
 
 st.set_page_config(
@@ -92,25 +91,27 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
 
 
 def default_watchlist() -> str:
-    """Read the latest default watchlist from the deployed repository."""
+    """Read the current default watchlist shipped with the deployed app."""
     path = scanner.DEFAULT_WATCHLIST
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 def parse_watchlist(raw_text: str) -> list[str]:
-    """Parse watchlist text while ignoring comments, blanks, commas, and duplicates."""
-    out: list[str] = []
+    """Parse one-ticker-per-line input, ignoring comments, commas, blanks, and duplicates."""
+    tickers: list[str] = []
     seen: set[str] = set()
 
     for line in raw_text.splitlines():
-        without_comment = line.split("#", 1)[0].replace(",", " ").strip()
-        for token in without_comment.split():
+        line_without_comment = line.split("#", 1)[0].replace(",", " ").strip()
+
+        for token in line_without_comment.split():
             ticker = token.strip().upper()
+
             if ticker and ticker not in seen:
                 seen.add(ticker)
-                out.append(ticker)
+                tickers.append(ticker)
 
-    return out
+    return tickers
 
 
 def build_args(
@@ -121,14 +122,14 @@ def build_args(
     custom_rel_volume: float,
     custom_min_score: int,
 ) -> SimpleNamespace:
+    """Build the scanner argument object expected by the backend."""
     settings = dict(PROFILE_SETTINGS[profile])
 
-    # Front-end controls override profile defaults.
+    # User-visible controls override the selected profile defaults.
     settings["target_pct"] = float(target_pct)
     settings["min_rel_volume"] = float(custom_rel_volume)
     settings["min_score"] = int(custom_min_score)
 
-    # Shared scanner/runtime settings.
     settings.update(
         {
             "period": "60d",
@@ -139,8 +140,8 @@ def build_args(
             "retry_delay_seconds": 1.0,
             "max_workers": int(workers),
 
-            # Required by target_clear_of_resistance() in the backend scanner.
-            # Matches the command-line script default.
+            # Required by scanner.target_clear_of_resistance().
+            # Same default as the CLI backend.
             "resistance_target_buffer_pct": 0.50,
         }
     )
@@ -154,13 +155,13 @@ def scan_watchlist(
     progress_callback,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
     """
-    Run the backend screener and preserve downloaded hourly candles for charts.
+    Run the backend screener.
 
     Returns:
-      - potential long entries
-      - all classifications
+      - Good long-entry candidates
+      - All classifications
       - Yahoo/provider/data errors
-      - downloaded hourly OHLCV data by ticker
+      - Raw hourly OHLCV data keyed by ticker for candidate charts
     """
     data_by_ticker: dict[str, pd.DataFrame] = {}
     errors: list[dict[str, str]] = []
@@ -247,17 +248,9 @@ def scan_watchlist(
     )
 
 
-
 def dataframe_csv(df: pd.DataFrame) -> bytes:
+    """Create downloadable CSV bytes."""
     return df.to_csv(index=False).encode("utf-8")
-
-
-def title_block() -> None:
-    st.title("Hourly Swing Screener")
-    st.caption(
-        "On-demand 60-minute chart scan. Output contains only potential "
-        "long-entry candidates using the selected swing framework."
-    )
 
 
 def candidate_chart(
@@ -265,7 +258,7 @@ def candidate_chart(
     raw_data: pd.DataFrame,
     candidate: dict[str, Any],
 ) -> go.Figure:
-    """Create an hourly candlestick chart for one screener candidate."""
+    """Create an interactive hourly candlestick chart for one screener candidate."""
     data = scanner.add_indicators(raw_data).tail(80).copy()
 
     figure = make_subplots(
@@ -347,7 +340,13 @@ def candidate_chart(
         height=680,
         margin=dict(l=20, r=135, t=55, b=20),
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
         hovermode="x unified",
     )
 
@@ -357,10 +356,17 @@ def candidate_chart(
 
     return figure
 
-title_block()
+
+st.title("Hourly Swing Screener")
+st.caption(
+    "On-demand 60-minute chart scan. Output contains only potential long-entry "
+    "candidates using the selected swing framework."
+)
+
 
 if "watchlist_text" not in st.session_state:
     st.session_state.watchlist_text = default_watchlist()
+
 
 with st.expander("Watchlist and scan settings", expanded=False):
     if st.button("Reload saved watchlist from GitHub"):
@@ -489,7 +495,7 @@ if run_clicked:
         last_ticker.caption(f"Latest completed data request: {ticker}")
 
     with st.spinner("Scanning completed hourly candles…"):
-        good_entries, classifications, errors = scan_watchlist(
+        good_entries, classifications, errors, price_data = scan_watchlist(
             tickers,
             args,
             update_progress,
@@ -501,6 +507,7 @@ if run_clicked:
     st.session_state.last_good_entries = good_entries
     st.session_state.last_classifications = classifications
     st.session_state.last_errors = errors
+    st.session_state.last_price_data = price_data
     st.session_state.last_profile = profile
     st.session_state.last_target_pct = target_pct
     st.session_state.last_show_debug = show_debug
@@ -516,14 +523,10 @@ classifications: pd.DataFrame = st.session_state.last_classifications
 errors: pd.DataFrame = st.session_state.last_errors
 target_pct: float = st.session_state.last_target_pct
 
-total_classified = len(classifications)
-entry_count = len(good_entries)
-data_error_count = len(errors)
-
 metric_1, metric_2, metric_3 = st.columns(3)
-metric_1.metric("Potential long entries", entry_count)
-metric_2.metric("Classified tickers", total_classified)
-metric_3.metric("Data errors / unavailable", data_error_count)
+metric_1.metric("Potential long entries", len(good_entries))
+metric_2.metric("Classified tickers", len(classifications))
+metric_3.metric("Data errors / unavailable", len(errors))
 
 st.subheader("Good long-entry candidates")
 
@@ -581,6 +584,46 @@ else:
         use_container_width=True,
     )
 
+    st.subheader("Candidate chart")
+
+    chart_tickers = good_entries["Ticker"].dropna().tolist()
+
+    selected_chart_ticker = st.selectbox(
+        "Choose a candidate to inspect",
+        options=chart_tickers,
+        key="selected_candidate_chart",
+    )
+
+    selected_row = good_entries.loc[
+        good_entries["Ticker"] == selected_chart_ticker
+    ].iloc[0].to_dict()
+
+    price_data = st.session_state.get("last_price_data", {})
+    raw_chart_data = price_data.get(selected_chart_ticker)
+
+    if raw_chart_data is None or raw_chart_data.empty:
+        st.warning(
+            f"No hourly chart data is available for {selected_chart_ticker}."
+        )
+    else:
+        st.caption(
+            f"Pattern: **{selected_row.get('Pattern')}** · "
+            f"Last completed bar: `{selected_row.get('LastCompletedHourlyBar')}`"
+        )
+
+        st.plotly_chart(
+            candidate_chart(
+                selected_chart_ticker,
+                raw_chart_data,
+                selected_row,
+            ),
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+                "scrollZoom": True,
+            },
+        )
+
     with st.expander("How to read these results", expanded=False):
         st.markdown(
             f"""
@@ -588,9 +631,9 @@ else:
 - **Entry** is the last fully completed hourly candle close, not a command to market-buy.
 - **Stop** is the structural invalidation point for that pattern.
 - **Target** is Entry × **{target_pct:.1f}%**.
-- **Reward/Risk** is the potential target reward divided by the entry-to-stop risk. Higher is better.
+- **Reward/Risk** is the potential target reward divided by the entry-to-stop risk.
 - **RelVol20** above `1.0×` means the final completed hour traded more volume than the 20-hour average.
-- **ResistanceBefore5pctTarget = True** means a marked resistance level appears before the full target. Treat it as a decision point: a clean break/hold can justify continuing; rejection can justify reducing or exiting.
+- **ResistanceBefore5pctTarget = True** means a marked resistance level appears before the full target.
 - Every result still needs a live-price check, daily-chart resistance check, and earnings/news check before an order.
 """
         )
