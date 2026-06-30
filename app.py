@@ -8,6 +8,9 @@ import pandas as pd
 import streamlit as st
 
 import swing_screener_6_patterns as scanner
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
 
 
 st.set_page_config(
@@ -149,14 +152,15 @@ def scan_watchlist(
     tickers: list[str],
     args: SimpleNamespace,
     progress_callback,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
     """
-    Run the same backend engine as the desktop script.
+    Run the backend screener and preserve downloaded hourly candles for charts.
 
     Returns:
       - potential long entries
       - all classifications
       - Yahoo/provider/data errors
+      - downloaded hourly OHLCV data by ticker
     """
     data_by_ticker: dict[str, pd.DataFrame] = {}
     errors: list[dict[str, str]] = []
@@ -239,7 +243,9 @@ def scan_watchlist(
         pd.DataFrame(candidates),
         pd.DataFrame(classifications),
         pd.DataFrame(errors),
+        data_by_ticker,
     )
+
 
 
 def dataframe_csv(df: pd.DataFrame) -> bytes:
@@ -253,6 +259,103 @@ def title_block() -> None:
         "long-entry candidates using the selected swing framework."
     )
 
+
+def candidate_chart(
+    ticker: str,
+    raw_data: pd.DataFrame,
+    candidate: dict[str, Any],
+) -> go.Figure:
+    """Create an hourly candlestick chart for one screener candidate."""
+    data = scanner.add_indicators(raw_data).tail(80).copy()
+
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.78, 0.22],
+        subplot_titles=(f"{ticker} — hourly setup", "Hourly volume"),
+    )
+
+    figure.add_trace(
+        go.Candlestick(
+            x=data.index,
+            open=data["Open"],
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
+            name="Hourly price",
+        ),
+        row=1,
+        col=1,
+    )
+
+    figure.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["EMA20"],
+            mode="lines",
+            name="EMA20",
+        ),
+        row=1,
+        col=1,
+    )
+
+    figure.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["EMA50"],
+            mode="lines",
+            name="EMA50",
+        ),
+        row=1,
+        col=1,
+    )
+
+    figure.add_trace(
+        go.Bar(
+            x=data.index,
+            y=data["Volume"],
+            name="Volume",
+        ),
+        row=2,
+        col=1,
+    )
+
+    levels = [
+        ("Entry", candidate.get("Entry")),
+        ("Stop", candidate.get("Stop")),
+        ("Target", candidate.get("Target_5pct")),
+        ("Support", candidate.get("Support")),
+        ("Resistance", candidate.get("Resistance")),
+    ]
+
+    for label, level in levels:
+        if level is None or pd.isna(level):
+            continue
+
+        figure.add_hline(
+            y=float(level),
+            row=1,
+            col=1,
+            line_dash="dot",
+            annotation_text=f"{label}: ${float(level):.2f}",
+            annotation_position="right",
+        )
+
+    figure.update_layout(
+        height=680,
+        margin=dict(l=20, r=135, t=55, b=20),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+    )
+
+    figure.update_yaxes(title_text="Price", row=1, col=1)
+    figure.update_yaxes(title_text="Volume", row=2, col=1)
+    figure.update_xaxes(showgrid=False)
+
+    return figure
 
 title_block()
 
