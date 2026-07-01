@@ -1,441 +1,557 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
+import concurrent.futures
+from types import SimpleNamespace
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-import friday_covered_call_screener as screener
+import swing_screener_6_patterns as scanner
 
 
 st.set_page_config(
-    page_title="Friday Option-Income Screener",
-    page_icon="💵",
+    page_title="Hourly Swing Screener",
+    page_icon="📈",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
-
-STRATEGY_LABELS = {
-    "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
-    "Covered calls — stock already owned": "covered_call",
+PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
+    "Fresh momentum": {
+        "min_score": 60,
+        "max_risk_pct": 3.75,
+        "min_reward_risk": 1.25,
+        "min_rel_volume": 0.80,
+        "min_hourly_dollar_volume": 250_000,
+        "min_price": 3.00,
+        "pullback_touch_pct": 2.0,
+        "pullback_max_ema20_distance_pct": 2.0,
+        "pullback_volume_multiplier": 1.20,
+        "breakout_event_volume_multiplier": 1.10,
+        "breakout_retest_tolerance_pct": 2.0,
+        "breakout_max_extension_pct": 2.0,
+        "range_support_distance_pct": 2.0,
+        "reversal_higher_low_pct": 0.25,
+        "reversal_structure_break_pct": 0.10,
+        "reversal_min_rel_volume": 0.90,
+        "allow_resistance_before_target": False,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": False,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": True,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": True,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
+    },
+    "Fresh momentum — broader": {
+        "min_score": 55,
+        "max_risk_pct": 5.0,
+        "min_reward_risk": 1.00,
+        "min_rel_volume": 0.60,
+        "min_hourly_dollar_volume": 150_000,
+        "min_price": 3.00,
+        "pullback_touch_pct": 2.5,
+        "pullback_max_ema20_distance_pct": 3.0,
+        "pullback_volume_multiplier": 1.30,
+        "breakout_event_volume_multiplier": 0.90,
+        "breakout_retest_tolerance_pct": 2.5,
+        "breakout_max_extension_pct": 3.0,
+        "range_support_distance_pct": 3.0,
+        "reversal_higher_low_pct": 0.10,
+        "reversal_structure_break_pct": 0.0,
+        "reversal_min_rel_volume": 0.75,
+        "allow_resistance_before_target": True,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": True,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": True,
+        "fresh_breakout_lookback_bars": 12,
+        "fresh_breakout_min_rel_volume": 0.80,
+        "fresh_breakout_max_extension_pct": 2.00,
+        "allow_early_recovery": True,
+        "early_recovery_lookback_bars": 5,
+        "early_recovery_min_rel_volume": 0.75,
+        "early_recovery_max_ema20_distance_pct": 2.50,
+        "early_recovery_structure_break_pct": 0.0,
+    },
+    "Balanced": {
+        "min_score": 58,
+        "max_risk_pct": 4.5,
+        "min_reward_risk": 1.10,
+        "min_rel_volume": 0.45,
+        "min_hourly_dollar_volume": 100_000,
+        "min_price": 1.00,
+        "pullback_touch_pct": 3.0,
+        "pullback_max_ema20_distance_pct": 5.0,
+        "pullback_volume_multiplier": 1.30,
+        "breakout_event_volume_multiplier": 0.90,
+        "breakout_retest_tolerance_pct": 3.0,
+        "breakout_max_extension_pct": 4.0,
+        "range_support_distance_pct": 4.0,
+        "reversal_higher_low_pct": 0.25,
+        "reversal_structure_break_pct": 0.0,
+        "reversal_min_rel_volume": 0.60,
+        "allow_resistance_before_target": True,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": False,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
+    },
+    "Relaxed review": {
+        "min_score": 52,
+        "max_risk_pct": 5.0,
+        "min_reward_risk": 1.00,
+        "min_rel_volume": 0.30,
+        "min_hourly_dollar_volume": 75_000,
+        "min_price": 1.00,
+        "pullback_touch_pct": 4.0,
+        "pullback_max_ema20_distance_pct": 7.0,
+        "pullback_volume_multiplier": 1.50,
+        "breakout_event_volume_multiplier": 0.70,
+        "breakout_retest_tolerance_pct": 4.0,
+        "breakout_max_extension_pct": 6.0,
+        "range_support_distance_pct": 5.0,
+        "reversal_higher_low_pct": 0.10,
+        "reversal_structure_break_pct": 0.0,
+        "reversal_min_rel_volume": 0.45,
+        "allow_resistance_before_target": True,
+        "allow_neutral_candle": True,
+        "allow_reversal_below_ema50": True,
+        "allow_uptrend_continuation": True,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
+    },
+    "Strict": {
+        "min_score": 72,
+        "max_risk_pct": 3.25,
+        "min_reward_risk": 1.60,
+        "min_rel_volume": 0.85,
+        "min_hourly_dollar_volume": 500_000,
+        "min_price": 3.00,
+        "pullback_touch_pct": 1.20,
+        "pullback_max_ema20_distance_pct": 3.0,
+        "pullback_volume_multiplier": 1.10,
+        "breakout_event_volume_multiplier": 1.25,
+        "breakout_retest_tolerance_pct": 1.50,
+        "breakout_max_extension_pct": 2.50,
+        "range_support_distance_pct": 2.0,
+        "reversal_higher_low_pct": 0.60,
+        "reversal_structure_break_pct": 0.10,
+        "reversal_min_rel_volume": 1.00,
+        "allow_resistance_before_target": False,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": False,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
+    },
 }
 
 
 def default_watchlist() -> str:
-    if DEFAULT_WATCHLIST.exists():
-        return DEFAULT_WATCHLIST.read_text(encoding="utf-8")
-    return "# Add one ticker per line\n"
+    path = scanner.DEFAULT_WATCHLIST
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def basis_value(label: str) -> str:
-    return {
-        "Bid — conservative / executable reference": "bid",
-        "Mark — (Bid + Ask) / 2": "mark",
-        "Last trade": "last",
-    }[label]
+def parse_watchlist(raw_text: str) -> list[str]:
+    tickers: list[str] = []
+    seen: set[str] = set()
+
+    for line in raw_text.splitlines():
+        cleaned = line.split("#", 1)[0].replace(",", " ").strip()
+        for token in cleaned.split():
+            ticker = token.upper()
+            if ticker and ticker not in seen:
+                seen.add(ticker)
+                tickers.append(ticker)
+
+    return tickers
 
 
-def strategy_title(strategy: str) -> str:
-    return "Cash-secured put candidates" if strategy == "cash_secured_put" else "Covered-call candidates"
+def build_args(
+    profile: str,
+    target_pct: float,
+    show_prepost: bool,
+    workers: int,
+    custom_rel_volume: float,
+    custom_min_score: int,
+) -> SimpleNamespace:
+    settings = dict(PROFILE_SETTINGS[profile])
+    settings["target_pct"] = float(target_pct)
+    settings["min_rel_volume"] = float(custom_rel_volume)
+    settings["min_score"] = int(custom_min_score)
+    settings.update(
+        {
+            "period": "60d",
+            "interval": "60m",
+            "include_prepost": bool(show_prepost),
+            "min_completed_bars": 60,
+            "download_retries": 3,
+            "retry_delay_seconds": 1.0,
+            "max_workers": int(workers),
+            "resistance_target_buffer_pct": 0.50,
+        }
+    )
+    return SimpleNamespace(**settings)
 
 
-def strategy_button_text(strategy: str) -> str:
-    return "Run Friday cash-secured-put scan" if strategy == "cash_secured_put" else "Run Friday covered-call scan"
+def scan_watchlist(
+    tickers: list[str],
+    args: SimpleNamespace,
+    progress_callback,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    data_by_ticker: dict[str, pd.DataFrame] = {}
+    errors: list[dict[str, str]] = []
+    classifications: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
 
+    completed = 0
+    total = len(tickers)
 
-def candidate_columns(strategy: str) -> list[str]:
-    common = [
-        "Ticker",
-        "Spot",
-        "Expiry",
-        "DaysToExpiry",
-        "Strike",
-        "StrikeDiscount_pct",
-        "Bid",
-        "Ask",
-        "Mark",
-        "MarkBidGap",
-        "MarkBidGap_pct",
-        "PremiumBasis",
-        "PremiumUsed",
-    ]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, args.max_workers)
+    ) as executor:
+        jobs = {
+            executor.submit(
+                scanner.fetch_hourly,
+                ticker,
+                args.period,
+                args.interval,
+                args.include_prepost,
+                args.min_completed_bars,
+                args.download_retries,
+                args.retry_delay_seconds,
+            ): ticker
+            for ticker in tickers
+        }
 
-    if strategy == "cash_secured_put":
-        return common + [
-            "CashCollateral_perContract",
-            "PremiumCredit_perContract",
-            "PremiumYieldOnCollateral_pct",
-            "PutBreakeven",
-            "MaxFallBeforePutLoss_pct",
-            "EstimatedAbsPutDelta",
-            "BidAskSpread_pct",
-            "OpenInterest",
-            "OptionVolume",
-            "ImpliedVolatility_pct",
-            "ContractSymbol",
-        ]
+        for future in concurrent.futures.as_completed(jobs):
+            ticker, frame, error = future.result()
+            completed += 1
 
-    return common + [
-        "AssignmentBreakEven",
-        "AssignmentProfit_pct",
-        "MaxFallBeforeCoveredCallLoss_pct",
-        "CoveredCallDownsideBreakeven",
-        "BidAskSpread_pct",
-        "OpenInterest",
-        "OptionVolume",
-        "ImpliedVolatility_pct",
-        "ContractSymbol",
-    ]
+            if frame is None:
+                errors.append({"Ticker": ticker, "Error": error or "Unknown Yahoo data error"})
+            else:
+                data_by_ticker[ticker] = frame
 
+            progress_callback(completed, total, ticker)
 
-def candidate_column_config(strategy: str) -> dict:
-    config = {
-        "Spot": st.column_config.NumberColumn(format="$%.2f"),
-        "Strike": st.column_config.NumberColumn(format="$%.2f"),
-        "Bid": st.column_config.NumberColumn(format="$%.2f"),
-        "Ask": st.column_config.NumberColumn(format="$%.2f"),
-        "Mark": st.column_config.NumberColumn(format="$%.2f"),
-        "MarkBidGap": st.column_config.NumberColumn(
-            "Mark − Bid",
-            format="$%.2f",
-            help="Midpoint mark minus bid. Smaller is closer to the bid used as a conservative execution reference.",
+    for ticker in tickers:
+        frame = data_by_ticker.get(ticker)
+        if frame is None:
+            continue
+
+        try:
+            candidate, debug = scanner.classify_ticker(ticker, frame, args)
+            classifications.append(debug)
+            if candidate is not None:
+                candidates.append(candidate)
+        except Exception as exc:
+            errors.append(
+                {
+                    "Ticker": ticker,
+                    "Error": f"Classification error: {type(exc).__name__}: {exc}",
+                }
+            )
+
+    candidates.sort(
+        key=lambda row: (
+            row.get("Score", 0),
+            row.get("RewardRisk_to_Target", 0),
+            row.get("RelVol20", 0),
         ),
-        "MarkBidGap_pct": st.column_config.NumberColumn(
-            "Mark − Bid %",
-            format="%.2f%%",
-        ),
-        "PremiumUsed": st.column_config.NumberColumn(format="$%.2f"),
-        "StrikeDiscount_pct": st.column_config.NumberColumn(format="%.2f%%"),
-        "BidAskSpread_pct": st.column_config.NumberColumn(format="%.2f%%"),
-        "ImpliedVolatility_pct": st.column_config.NumberColumn(format="%.2f%%"),
-    }
+        reverse=True,
+    )
+    classifications.sort(key=lambda row: row.get("Ticker", ""))
+    errors.sort(key=lambda row: row.get("Ticker", ""))
 
-    if strategy == "cash_secured_put":
-        config.update(
-            {
-                "CashCollateral_perContract": st.column_config.NumberColumn(
-                    "Cash collateral / contract",
-                    format="$%.0f",
-                ),
-                "PremiumCredit_perContract": st.column_config.NumberColumn(
-                    "Premium credit / contract",
-                    format="$%.0f",
-                ),
-                "PremiumYieldOnCollateral_pct": st.column_config.NumberColumn(
-                    "Premium yield on collateral",
-                    format="%.2f%%",
-                    help="Premium used divided by strike cash collateral, before fees and taxes.",
-                ),
-                "PutBreakeven": st.column_config.NumberColumn(
-                    "Effective purchase breakeven",
-                    format="$%.2f",
-                    help="Strike minus premium used. Assignment means buying 100 shares at the strike; the premium reduces the economic basis.",
-                ),
-                "MaxFallBeforePutLoss_pct": st.column_config.NumberColumn(
-                    "Max fall before put loss",
-                    format="%.2f%%",
-                    help="Distance from spot to strike minus premium. Higher gives more downside room before an assigned position has an unrealized loss versus current spot.",
-                ),
-                "EstimatedAbsPutDelta": st.column_config.NumberColumn(
-                    "Estimated |put delta|",
-                    format="%.3f",
-                    help="Black-Scholes estimate using Yahoo implied volatility and DTE. It is a risk proxy, not an assignment probability or guarantee.",
-                ),
-            }
-        )
-    else:
-        config.update(
-            {
-                "AssignmentBreakEven": st.column_config.NumberColumn(format="$%.2f"),
-                "AssignmentProfit_pct": st.column_config.NumberColumn(format="%.2f%%"),
-                "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn(format="%.2f%%"),
-                "CoveredCallDownsideBreakeven": st.column_config.NumberColumn(format="$%.2f"),
-            }
-        )
-
-    return config
+    return pd.DataFrame(candidates), pd.DataFrame(classifications), pd.DataFrame(errors)
 
 
-st.title("Friday Option-Income Screener")
+def dataframe_csv(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+st.title("Hourly Swing Screener")
 st.caption(
-    "On-demand scan for coming-Friday covered calls or cash-secured puts. "
-    "The put mode ranks qualifying contracts by the largest downside buffer first."
+    "On-demand 60-minute scan. Fresh momentum finds the first completed-hour "
+    "breakout/reclaim; confirmed profiles wait for more trend proof."
 )
 
-if "option_income_watchlist_text" not in st.session_state:
-    st.session_state.option_income_watchlist_text = default_watchlist()
+if "watchlist_text" not in st.session_state:
+    st.session_state.watchlist_text = default_watchlist()
 
-with st.expander("How the strategies work", expanded=False):
-    st.markdown(
-        """
-### Cash-secured put
-- You sell one put and reserve `strike × 100` cash in case you are assigned 100 shares.
-- **Premium yield on collateral** = `premium used / strike × 100`.
-- **Effective purchase breakeven** = `strike − premium used`.
-- **Max fall before put loss** = `(spot − (strike − premium used)) / spot × 100`.
-- A larger fall buffer and a lower estimated absolute put delta reduce risk, but neither prevents assignment or protects against a sharp decline.
-
-### Covered call
-- You own 100 shares and sell one call.
-- **Assignment profit** = `(strike + premium used − spot) / spot × 100`.
-- The premium offers only a limited downside cushion while upside is capped at the strike.
-
-The screener is for research and does not place orders. Confirm the live option chain, limit-order fill, earnings date, liquidity, and whether assignment is acceptable before trading.
-        """
+if "profile_select" not in st.session_state:
+    st.session_state.profile_select = "Fresh momentum — broader"
+if "min_score_control" not in st.session_state:
+    st.session_state.min_score_control = int(PROFILE_SETTINGS["Fresh momentum — broader"]["min_score"])
+if "min_rel_volume_control" not in st.session_state:
+    st.session_state.min_rel_volume_control = float(
+        PROFILE_SETTINGS["Fresh momentum — broader"]["min_rel_volume"]
     )
 
-with st.expander("Watchlist and scan settings", expanded=True):
-    top_left, top_right = st.columns([1, 4])
-    with top_left:
-        if st.button("Reload saved watchlist from GitHub"):
-            st.session_state.option_income_watchlist_text = default_watchlist()
-            st.rerun()
-    with top_right:
-        st.caption("For permanent defaults, edit `watchlist.txt` in GitHub and commit the change.")
+def reset_profile_controls() -> None:
+    """Keep the visible score and volume controls aligned with the selected profile."""
+    selected = st.session_state.profile_select
+    st.session_state.min_score_control = int(PROFILE_SETTINGS[selected]["min_score"])
+    st.session_state.min_rel_volume_control = float(
+        PROFILE_SETTINGS[selected]["min_rel_volume"]
+    )
+
+with st.expander("Watchlist and scan settings", expanded=False):
+    if st.button("Reload saved watchlist from GitHub"):
+        st.session_state.watchlist_text = default_watchlist()
+        st.rerun()
 
     st.text_area(
         "Watchlist",
-        key="option_income_watchlist_text",
-        height=220,
-        help="One ticker per line. Commas are accepted. Lines beginning with # are ignored.",
+        key="watchlist_text",
+        height=250,
+        help="One symbol per line. Blank lines and # comments are ignored. Changes apply only to this browser session.",
     )
-
-    strategy_label = st.selectbox(
-        "Strategy",
-        options=list(STRATEGY_LABELS),
-        index=0,
-        help="Cash-secured puts are the default because this mode prioritizes the largest fall buffer while targeting premium income.",
-    )
-    strategy = STRATEGY_LABELS[strategy_label]
-
-    row1 = st.columns(4)
-    with row1[0]:
-        min_strike_discount = st.number_input(
-            "Minimum strike discount below spot (%)",
-            min_value=0.0,
-            max_value=95.0,
-            value=20.0,
-            step=1.0,
-            help="For a put, the strike must be at least this far below spot before premium. A 20% strike discount plus premium creates a slightly larger breakeven buffer.",
-        )
-    with row1[1]:
-        min_return = st.number_input(
-            "Minimum premium yield on collateral (%)" if strategy == "cash_secured_put" else "Minimum assignment profit (%)",
-            min_value=-50.0 if strategy == "covered_call" else 0.0,
-            max_value=100.0,
-            value=1.0,
-            step=0.25,
-        )
-    with row1[2]:
-        max_return = st.number_input(
-            "Maximum premium yield on collateral (%)" if strategy == "cash_secured_put" else "Maximum assignment profit (%)",
-            min_value=-50.0 if strategy == "covered_call" else 0.0,
-            max_value=100.0,
-            value=8.0,
-            step=0.25,
-        )
-    with row1[3]:
-        premium_basis_label = st.selectbox(
-            "Premium used in calculation",
-            options=[
-                "Bid — conservative / executable reference",
-                "Mark — (Bid + Ask) / 2",
-                "Last trade",
-            ],
-            index=0,
-            help="Bid is the conservative reference. A midpoint Mark is an estimate and may not be fillable.",
-        )
-
-    row2 = st.columns(4)
-    with row2[0]:
-        min_open_interest = st.number_input(
-            "Minimum open interest",
-            min_value=0,
-            max_value=1_000_000,
-            value=25,
-            step=5,
-        )
-    with row2[1]:
-        min_option_volume = st.number_input(
-            "Minimum option volume",
-            min_value=0,
-            max_value=1_000_000,
-            value=1,
-            step=1,
-        )
-    with row2[2]:
-        max_spread = st.number_input(
-            "Maximum bid-ask spread (%)",
-            min_value=1.0,
-            max_value=300.0,
-            value=15.0,
-            step=1.0,
-            help="A tighter cap avoids very illiquid contracts. The Bid setting still controls the premium calculation.",
-        )
-    with row2[3]:
-        max_expiry_days = st.number_input(
-            "Maximum days to weekly expiry",
-            min_value=1,
-            max_value=21,
-            value=10,
-            step=1,
-            help="The app will not substitute a farther monthly expiration when the coming weekly chain is unavailable.",
-        )
-
-    row3 = st.columns(3)
-    with row3[0]:
-        if strategy == "cash_secured_put":
-            max_abs_put_delta = st.slider(
-                "Maximum estimated |put delta|",
-                min_value=0.05,
-                max_value=0.50,
-                value=0.15,
-                step=0.01,
-                help="Lower is more conservative. This is an IV-based delta estimate, not the probability of assignment.",
-            )
-        else:
-            max_abs_put_delta = 1.0
-            st.caption("Estimated put delta is used only in cash-secured-put mode.")
-    with row3[1]:
-        workers = st.slider("Yahoo request concurrency", min_value=1, max_value=5, value=3)
-    with row3[2]:
-        include_extended_spot = st.checkbox(
-            "Use premarket / after-hours stock price when Yahoo supplies it",
-            value=False,
-        )
-
-    show_debug = st.checkbox("Show all ticker diagnostics and data errors", value=True)
-
-run_scan = st.button(strategy_button_text(strategy), type="primary", use_container_width=True)
-
-if run_scan:
-    tickers = screener.parse_tickers(st.session_state.option_income_watchlist_text)
-    if not tickers:
-        st.error("Add at least one ticker to the watchlist.")
-        st.stop()
-    if min_return > max_return:
-        st.error("Minimum return cannot exceed maximum return.")
-        st.stop()
-
-    config = screener.ScanConfig(
-        strategy=strategy,
-        min_strike_discount_pct=float(min_strike_discount),
-        min_return_pct=float(min_return),
-        max_return_pct=float(max_return),
-        premium_basis=basis_value(premium_basis_label),
-        max_abs_put_delta=float(max_abs_put_delta),
-        min_open_interest=int(min_open_interest),
-        min_option_volume=int(min_option_volume),
-        max_bid_ask_spread_pct=float(max_spread),
-        max_expiry_days=int(max_expiry_days),
-        include_extended_spot=include_extended_spot,
-        max_workers=int(workers),
-    )
-
-    progress_bar = st.progress(0, text="Starting Yahoo option-chain requests…")
-    progress_text = st.empty()
-
-    def update_progress(done: int, total: int, ticker: str, status: str) -> None:
-        progress_bar.progress(done / total, text=f"{done}/{total}: {ticker} — {status}")
-        progress_text.caption("Yahoo option chains can be delayed, incomplete, or temporarily rate-limited.")
-
-    started_at = datetime.now(timezone.utc)
-    with st.spinner("Scanning option chains…"):
-        output = screener.scan_tickers(tickers, config, progress_callback=update_progress)
-    finished_at = datetime.now(timezone.utc)
-
-    progress_bar.empty()
-    progress_text.empty()
-
-    st.session_state.option_income_output = output
-    st.session_state.option_income_scanned_at = finished_at
-    st.session_state.option_income_elapsed_seconds = (finished_at - started_at).total_seconds()
-    st.session_state.option_income_strategy = strategy
-    st.session_state.option_income_show_debug = show_debug
-
-
-if "option_income_output" in st.session_state:
-    output: screener.ScanOutput = st.session_state.option_income_output
-    displayed_strategy: str = st.session_state.option_income_strategy
-    candidates = pd.DataFrame(output.candidates)
-    diagnostics = pd.DataFrame(output.diagnostics)
-    errors = pd.DataFrame(output.errors)
-
     st.caption(
-        f"Last scan completed {st.session_state.option_income_scanned_at.strftime('%Y-%m-%d %H:%M:%S UTC')} "
-        f"in {st.session_state.option_income_elapsed_seconds:.1f}s."
+        "To permanently change the default list, edit `watchlist.txt` in the GitHub repository and commit it."
     )
 
-    metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric(f"Potential {strategy_title(displayed_strategy).lower()}", len(candidates))
-    metric_2.metric("Tickers checked", len(diagnostics))
-    metric_3.metric("Data errors / unavailable", len(errors))
+    controls_1, controls_2, controls_3 = st.columns(3)
+    with controls_1:
+        profile = st.selectbox(
+            "Scan profile",
+            options=[
+                "Fresh momentum",
+                "Fresh momentum — broader",
+                "Balanced",
+                "Relaxed review",
+                "Strict",
+            ],
+            key="profile_select",
+            on_change=reset_profile_controls,
+            help=(
+                "Fresh momentum is the stricter early-signal mode. Fresh momentum — broader "
+                "uses shorter bases, lower volume thresholds, and allows nearby resistance for a larger review list."
+            ),
+        )
+    with controls_2:
+        target_pct = st.number_input(
+            "Profit target (%)",
+            min_value=1.0,
+            max_value=15.0,
+            value=5.0,
+            step=0.5,
+        )
+    with controls_3:
+        include_prepost = st.checkbox("Include premarket / after-hours", value=True)
 
-    st.subheader(
-        "Maximum-buffer qualifying cash-secured-put candidates"
-        if displayed_strategy == "cash_secured_put"
-        else "Lowest-strike qualifying covered-call candidates"
+    controls_4, controls_5, controls_6 = st.columns(3)
+    with controls_4:
+        min_score = st.slider(
+            "Minimum setup score",
+            min_value=45,
+            max_value=90,
+            step=1,
+            key="min_score_control",
+        )
+    with controls_5:
+        min_rel_volume = st.slider(
+            "Minimum relative volume",
+            min_value=0.20,
+            max_value=1.50,
+            step=0.05,
+            key="min_rel_volume_control",
+        )
+    with controls_6:
+        workers = st.select_slider(
+            "Yahoo request concurrency",
+            options=[1, 2, 3, 4],
+            value=3,
+            help="Use 1–2 if Yahoo temporarily returns errors. Higher is faster but can be less reliable.",
+        )
+
+    show_debug = st.checkbox("Show classifications and data errors after scan", value=True)
+
+    if profile.startswith("Fresh momentum"):
+        st.caption(
+            "Fresh momentum profiles only accept signals from the latest completed hourly bar. "
+            "The broader mode gives more early ideas but has more false starts; it is not for automatic orders."
+        )
+
+tickers = parse_watchlist(st.session_state.watchlist_text)
+status_left, status_right = st.columns([3, 1])
+with status_left:
+    st.write(f"**{len(tickers)} unique tickers loaded**")
+with status_right:
+    run_clicked = st.button("Run scan", type="primary", use_container_width=True)
+
+if run_clicked:
+    if not tickers:
+        st.error("No valid ticker symbols in the watchlist.")
+        st.stop()
+
+    args = build_args(
+        profile=profile,
+        target_pct=target_pct,
+        show_prepost=include_prepost,
+        workers=workers,
+        custom_rel_volume=min_rel_volume,
+        custom_min_score=min_score,
     )
 
-    if candidates.empty:
-        st.info("No option contracts passed every active filter in this scan.")
-    else:
-        visible = candidates.reindex(columns=candidate_columns(displayed_strategy)).copy()
-        st.dataframe(
-            visible,
-            use_container_width=True,
-            hide_index=True,
-            column_config=candidate_column_config(displayed_strategy),
+    progress = st.progress(0, text="Starting scan…")
+    last_ticker = st.empty()
+
+    def update_progress(done: int, total: int, ticker: str) -> None:
+        progress.progress(
+            int(done / total * 100),
+            text=f"Downloading hourly data: {done}/{total}",
+        )
+        last_ticker.caption(f"Latest completed data request: {ticker}")
+
+    with st.spinner("Scanning completed hourly candles…"):
+        good_entries, classifications, errors = scan_watchlist(
+            tickers,
+            args,
+            update_progress,
         )
 
-        if displayed_strategy == "cash_secured_put":
-            st.caption(
-                "Sorted by the largest fall before an assigned put position reaches its premium-adjusted breakeven, "
-                "then lower estimated absolute put delta and tighter Mark-to-Bid gap. "
-                "Assignment can still occur, and a sharp decline can create a large loss after assignment."
-            )
-            filename = "friday_cash_secured_put_candidates.csv"
-        else:
-            st.caption(
-                "Sorted by smallest Mark-to-Bid gap percentage, then smallest dollar gap. "
-                "A smaller gap means the midpoint Mark is closer to the executable Bid."
-            )
-            filename = "friday_covered_call_candidates.csv"
+    progress.empty()
+    last_ticker.empty()
 
-        st.download_button(
-            "Download candidates CSV",
-            data=candidates.to_csv(index=False).encode("utf-8"),
-            file_name=filename,
-            mime="text/csv",
-            use_container_width=True,
+    st.session_state.last_good_entries = good_entries
+    st.session_state.last_classifications = classifications
+    st.session_state.last_errors = errors
+    st.session_state.last_profile = profile
+    st.session_state.last_target_pct = target_pct
+    st.session_state.last_show_debug = show_debug
+
+if "last_good_entries" not in st.session_state:
+    st.info("Choose settings, then tap **Run scan**.")
+    st.stop()
+
+good_entries: pd.DataFrame = st.session_state.last_good_entries
+classifications: pd.DataFrame = st.session_state.last_classifications
+errors: pd.DataFrame = st.session_state.last_errors
+target_pct: float = st.session_state.last_target_pct
+profile: str = st.session_state.last_profile
+
+metric_1, metric_2, metric_3 = st.columns(3)
+metric_1.metric("Potential long entries", len(good_entries))
+metric_2.metric("Classified tickers", len(classifications))
+metric_3.metric("Data errors / unavailable", len(errors))
+
+st.subheader("Good long-entry candidates")
+
+if good_entries.empty:
+    st.warning(
+        "No names passed the selected rules. This is normal; do not force trades. "
+        "Use Fresh momentum for early movement ideas and Balanced/Strict for confirmation."
+    )
+else:
+    display_columns = [
+        "Ticker",
+        "Pattern",
+        "SignalPhase",
+        "Score",
+        "LastCompletedHourlyBar",
+        "Entry",
+        "Stop",
+        "Target_5pct",
+        "Risk_pct",
+        "RewardRisk_to_Target",
+        "RelVol20",
+        "ResistanceDistance_pct",
+        "ResistanceBefore5pctTarget",
+    ]
+    available_columns = [column for column in display_columns if column in good_entries.columns]
+
+    st.dataframe(
+        good_entries[available_columns],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Score": st.column_config.NumberColumn(format="%d"),
+            "Entry": st.column_config.NumberColumn(format="$%.2f"),
+            "Stop": st.column_config.NumberColumn(format="$%.2f"),
+            "Target_5pct": st.column_config.NumberColumn(format="$%.2f"),
+            "Risk_pct": st.column_config.NumberColumn(format="%.2f%%"),
+            "RewardRisk_to_Target": st.column_config.NumberColumn(format="%.2f"),
+            "RelVol20": st.column_config.NumberColumn(format="%.2f×"),
+            "ResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
+        },
+    )
+
+    st.download_button(
+        "Download good entries CSV",
+        data=dataframe_csv(good_entries),
+        file_name="good_entries.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    with st.expander("How to read Fresh momentum", expanded=False):
+        st.markdown(
+            f"""
+- **FRESH_BREAKOUT** = the latest completed hour moved through a defined base high; it is not a retest setup.
+- **EARLY_RECOVERY** = the latest completed hour reclaimed the 20 EMA or broke short structure after recent weakness.
+- **SignalPhase** tells you whether the setup is fresh on the current completed hourly bar or confirmed after more trend proof.
+- **Entry** is the prior completed candle close; it is not a market order instruction.
+- **Stop** is the proposed invalidation level. **Target** is Entry × **{target_pct:.1f}%**.
+- Fresh signals use tighter extension and volume rules, but they are naturally less confirmed and may fail more often than mature trend setups.
+- Check current price, the daily chart, earnings/news, and liquidity before acting.
+"""
         )
 
-    if st.session_state.option_income_show_debug:
-        st.subheader("All ticker diagnostics")
-        if diagnostics.empty:
-            st.info("No diagnostics were produced.")
+if st.session_state.last_show_debug:
+    with st.expander("All classifications", expanded=False):
+        if classifications.empty:
+            st.info("No ticker classifications available.")
         else:
-            st.dataframe(diagnostics, use_container_width=True, hide_index=True)
+            st.dataframe(classifications, use_container_width=True, hide_index=True)
             st.download_button(
-                "Download diagnostics CSV",
-                data=diagnostics.to_csv(index=False).encode("utf-8"),
-                file_name="friday_option_income_diagnostics.csv",
+                "Download classifications CSV",
+                data=dataframe_csv(classifications),
+                file_name="all_classifications.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
 
+    with st.expander("Yahoo / data errors", expanded=False):
         if errors.empty:
             st.success("No provider/data errors.")
         else:
-            st.subheader("Data errors")
             st.dataframe(errors, use_container_width=True, hide_index=True)
             st.download_button(
                 "Download errors CSV",
-                data=errors.to_csv(index=False).encode("utf-8"),
-                file_name="friday_option_income_errors.csv",
+                data=dataframe_csv(errors),
+                file_name="errors.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
