@@ -55,6 +55,9 @@ class ScanConfig:
     min_open_interest: int = 25
     min_option_volume: int = 1
     max_bid_ask_spread_pct: float = 15.0
+    # Applied only to cash-secured puts. This caps the underlying share price,
+    # not the strike/collateral. Set to None to disable the cap.
+    max_csp_underlying_price: float | None = 451.0
     include_extended_spot: bool = False
     max_workers: int = 3
     retries: int = 2
@@ -540,6 +543,34 @@ def scan_one_ticker(
                 ticker_obj,
                 config.include_extended_spot,
             )
+
+            # A share-price cap helps keep one-contract CSP collateral within
+            # the user's intended account size. It does not replace the broker's
+            # actual collateral check, which remains authoritative at order preview.
+            if (
+                config.strategy == "cash_secured_put"
+                and config.max_csp_underlying_price is not None
+                and spot > config.max_csp_underlying_price
+            ):
+                diagnostic = {
+                    "Ticker": ticker,
+                    "Strategy": config.strategy,
+                    "Spot": round_or_nan(spot),
+                    "Expiry": "",
+                    "ExpirySelection": "",
+                    "PremiumBasis": config.premium_basis,
+                    "MaxExpiryDays": config.max_expiry_days,
+                    "MaxCspUnderlyingPrice": round_or_nan(
+                        config.max_csp_underlying_price
+                    ),
+                    "Result": "SPOT_ABOVE_CSP_CAP",
+                    "Reason": (
+                        f"Spot ${spot:.2f} exceeds the CSP underlying-price cap "
+                        f"of ${config.max_csp_underlying_price:.2f}"
+                    ),
+                }
+                return None, diagnostic, None
+
             expiry, expiry_note = choose_furthest_expiry_within_window(
                 ticker_obj.options,
                 today=config.today,
@@ -578,6 +609,11 @@ def scan_one_ticker(
                 "ExpirySelection": expiry_note,
                 "PremiumBasis": config.premium_basis,
                 "MaxExpiryDays": config.max_expiry_days,
+                "MaxCspUnderlyingPrice": (
+                    round_or_nan(config.max_csp_underlying_price)
+                    if config.max_csp_underlying_price is not None
+                    else math.nan
+                ),
                 "Result": "QUALIFIED" if candidate is not None else "NO_MATCH",
                 "Reason": reason,
             }
@@ -592,6 +628,11 @@ def scan_one_ticker(
                 "ExpirySelection": "",
                 "PremiumBasis": config.premium_basis,
                 "MaxExpiryDays": config.max_expiry_days,
+                "MaxCspUnderlyingPrice": (
+                    round_or_nan(config.max_csp_underlying_price)
+                    if config.max_csp_underlying_price is not None
+                    else math.nan
+                ),
                 "Result": "NO_EXPIRY_WINDOW",
                 "Reason": str(exc),
             }
@@ -608,6 +649,11 @@ def scan_one_ticker(
                     "ExpirySelection": "",
                     "PremiumBasis": config.premium_basis,
                     "MaxExpiryDays": config.max_expiry_days,
+                    "MaxCspUnderlyingPrice": (
+                        round_or_nan(config.max_csp_underlying_price)
+                        if config.max_csp_underlying_price is not None
+                        else math.nan
+                    ),
                     "Result": "ERROR",
                     "Reason": error["Error"],
                 }
@@ -650,6 +696,11 @@ def scan_tickers(
                     "ExpirySelection": "",
                     "PremiumBasis": config.premium_basis,
                     "MaxExpiryDays": config.max_expiry_days,
+                    "MaxCspUnderlyingPrice": (
+                        round_or_nan(config.max_csp_underlying_price)
+                        if config.max_csp_underlying_price is not None
+                        else math.nan
+                    ),
                     "Result": "ERROR",
                     "Reason": f"Worker error: {type(exc).__name__}: {exc}",
                 }
@@ -712,6 +763,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-open-interest", type=int, default=25)
     parser.add_argument("--min-option-volume", type=int, default=1)
     parser.add_argument("--max-bid-ask-spread-pct", type=float, default=15.0)
+    parser.add_argument(
+        "--max-csp-underlying-price",
+        type=float,
+        default=451.0,
+        help="Cash-secured-put only: ignore tickers whose stock price is above this amount. Use 0 to disable.",
+    )
     parser.add_argument("--max-expiry-days", type=int, default=11)
     parser.add_argument("--include-extended-spot", action="store_true")
     parser.add_argument("--max-workers", type=int, default=3)
@@ -739,6 +796,11 @@ def main() -> None:
         min_open_interest=args.min_open_interest,
         min_option_volume=args.min_option_volume,
         max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
+        max_csp_underlying_price=(
+            args.max_csp_underlying_price
+            if args.max_csp_underlying_price > 0
+            else None
+        ),
         max_expiry_days=args.max_expiry_days,
         include_extended_spot=args.include_extended_spot,
         max_workers=args.max_workers,
