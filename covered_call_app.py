@@ -10,7 +10,7 @@ import friday_covered_call_screener as screener
 
 
 st.set_page_config(
-    page_title="Friday Option-Income Screener",
+    page_title="Option-Income Screener",
     page_icon="💵",
     layout="wide",
 )
@@ -43,7 +43,7 @@ def strategy_title(strategy: str) -> str:
 
 
 def strategy_button_text(strategy: str) -> str:
-    return "Run Friday cash-secured-put scan" if strategy == "cash_secured_put" else "Run Friday covered-call scan"
+    return "Run cash-secured-put scan" if strategy == "cash_secured_put" else "Run covered-call scan"
 
 
 def candidate_columns(strategy: str) -> list[str]:
@@ -159,9 +159,9 @@ def candidate_column_config(strategy: str) -> dict:
     return config
 
 
-st.title("Friday Option-Income Screener")
+st.title("Option-Income Screener")
 st.caption(
-    "On-demand scan for coming-Friday covered calls or cash-secured puts. "
+    "On-demand scan for covered calls or cash-secured puts. For each ticker, the scanner uses the furthest listed option expiry within your selected DTE cap. "
     "The put mode ranks qualifying contracts by the largest downside buffer first."
 )
 
@@ -277,12 +277,12 @@ with st.expander("Watchlist and scan settings", expanded=True):
         )
     with row2[3]:
         max_expiry_days = st.number_input(
-            "Maximum days to weekly expiry",
+            "Maximum days to expiry",
             min_value=1,
             max_value=21,
-            value=10,
+            value=11,
             step=1,
-            help="The app will not substitute a farther monthly expiration when the coming weekly chain is unavailable.",
+            help="For each ticker, selects the furthest listed option expiration that is no more than this many calendar days away.",
         )
 
     row3 = st.columns(3)
@@ -422,7 +422,7 @@ if "option_income_output" in st.session_state:
             st.download_button(
                 "Download diagnostics CSV",
                 data=diagnostics.to_csv(index=False).encode("utf-8"),
-                file_name="friday_option_income_diagnostics.csv",
+                file_name="option_income_diagnostics.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
@@ -435,7 +435,7 @@ if "option_income_output" in st.session_state:
             st.download_button(
                 "Download errors CSV",
                 data=errors.to_csv(index=False).encode("utf-8"),
-                file_name="friday_option_income_errors.csv",
+                file_name="option_income_errors.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
