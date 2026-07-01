@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Friday Option-Income Screener — covered calls and cash-secured puts.
+Option-Income Screener — covered calls and cash-secured puts.
 
 Strategies:
   * COVERED_CALL: own 100 shares and sell one call.
@@ -59,7 +59,7 @@ class ScanConfig:
     max_workers: int = 3
     retries: int = 2
     retry_delay_seconds: float = 0.8
-    max_expiry_days: int = 10
+    max_expiry_days: int = 11
     today: date | None = None
 
 
@@ -116,20 +116,22 @@ def load_tickers(path: Path | None = None) -> list[str]:
     return tickers
 
 
-def next_friday_on_or_after(day: date) -> date:
-    return day.fromordinal(day.toordinal() + (4 - day.weekday()) % 7)
-
-
 class NoEligibleExpiry(ValueError):
-    """Raised when Yahoo has no coming weekly expiry inside the configured window."""
+    """Raised when Yahoo has no listed option expiry inside the configured window."""
 
 
-def choose_nearest_friday_expiry(
+def choose_furthest_expiry_within_window(
     expiration_strings: Iterable[str],
     today: date | None = None,
-    max_expiry_days: int = 10,
+    max_expiry_days: int = 11,
 ) -> tuple[str, str]:
-    """Use only the coming Friday or holiday-adjusted weekly expiry inside the DTE cap."""
+    """Choose the latest listed option expiry no more than ``max_expiry_days`` away.
+
+    This deliberately does not force a Friday-only chain. For example, with an
+    11-day cap, it chooses the furthest listed expiration on or before
+    ``today + 11 calendar days``. This maximizes time value while keeping the
+    contract within the requested short-duration window.
+    """
     today = today or date.today()
     max_expiry_days = int(max_expiry_days)
     if max_expiry_days < 1:
@@ -138,11 +140,13 @@ def choose_nearest_friday_expiry(
     parsed: list[tuple[date, str]] = []
     for raw in expiration_strings:
         try:
-            parsed.append((datetime.strptime(str(raw), "%Y-%m-%d").date(), str(raw)))
+            expiry_date = datetime.strptime(str(raw), "%Y-%m-%d").date()
         except ValueError:
             continue
+        if expiry_date >= today:
+            parsed.append((expiry_date, str(raw)))
 
-    future = sorted((item for item in parsed if item[0] >= today), key=lambda item: item[0])
+    future = sorted(parsed, key=lambda item: item[0])
     if not future:
         raise NoEligibleExpiry("Yahoo returned no future option expirations")
 
@@ -154,20 +158,11 @@ def choose_nearest_friday_expiry(
             f"(nearest Yahoo expiry: {future[0][0].isoformat()})"
         )
 
-    target = next_friday_on_or_after(today)
-    exact = [item for item in in_window if item[0] == target]
-    if exact:
-        return exact[0][1], "Exact coming Friday expiration"
-
-    holiday_shift = [item for item in in_window if abs((item[0] - target).days) <= 1]
-    if holiday_shift:
-        chosen = min(holiday_shift, key=lambda item: (abs((item[0] - target).days), item[0]))
-        return chosen[1], "Coming weekly expiry (holiday-adjusted)"
-
-    available = ", ".join(item[0].isoformat() for item in in_window[:4]) or "none"
-    raise NoEligibleExpiry(
-        f"No coming Friday/holiday-shifted weekly expiry within {max_expiry_days} calendar days "
-        f"(available inside window: {available})"
+    chosen_date, chosen_expiry = max(in_window, key=lambda item: item[0])
+    dte = (chosen_date - today).days
+    return (
+        chosen_expiry,
+        f"Furthest listed expiry within {max_expiry_days} calendar days ({dte} DTE)",
     )
 
 
@@ -545,7 +540,7 @@ def scan_one_ticker(
                 ticker_obj,
                 config.include_extended_spot,
             )
-            expiry, expiry_note = choose_nearest_friday_expiry(
+            expiry, expiry_note = choose_furthest_expiry_within_window(
                 ticker_obj.options,
                 today=config.today,
                 max_expiry_days=config.max_expiry_days,
@@ -699,7 +694,7 @@ def write_csv(rows: list[dict], path: Path, columns: list[str] | None = None) ->
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Screen coming-Friday covered calls or cash-secured puts.",
+        description="Screen covered calls or cash-secured puts using the furthest listed expiry inside the DTE cap.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--tickers-file", type=Path, default=None)
@@ -717,7 +712,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-open-interest", type=int, default=25)
     parser.add_argument("--min-option-volume", type=int, default=1)
     parser.add_argument("--max-bid-ask-spread-pct", type=float, default=15.0)
-    parser.add_argument("--max-expiry-days", type=int, default=10)
+    parser.add_argument("--max-expiry-days", type=int, default=11)
     parser.add_argument("--include-extended-spot", action="store_true")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--retries", type=int, default=2)
