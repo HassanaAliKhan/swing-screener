@@ -2,13 +2,14 @@
 """
 Hourly Swing Screener — confirmed and fresh-momentum long setups.
 
-The scanner keeps the existing confirmed patterns and adds two earlier signals:
+The scanner keeps confirmed momentum setups and adds early-entry signals:
   - FRESH_BREAKOUT: the latest completed hourly candle has just broken a base.
   - EARLY_RECOVERY: a recent weak move is reclaiming the 20 EMA / short structure.
+  - CRASH_RECOVERY: a heavily sold-off name has made its first volume-backed
+    short-structure break; this intentionally does not require an EMA20 reclaim.
 
-Use the Fresh momentum profile in the Streamlit app for these early signals.
-It intentionally requires tighter entry extension and stronger volume than the
-relaxed profiles because first breakouts can fail more often.
+The crash-recovery profile looks for an early bounce after a meaningful recent
+hourly drawdown. It is a review signal, not a prediction or an automatic order.
 """
 
 from __future__ import annotations
@@ -102,6 +103,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-recovery-min-rel-volume", type=float, default=0.90)
     parser.add_argument("--early-recovery-max-ema20-distance-pct", type=float, default=1.75)
     parser.add_argument("--early-recovery-structure-break-pct", type=float, default=0.10)
+
+    # Deep-crash recovery. This is intentionally independent of EMA20/EMA50
+    # placement so it can surface the first structure break after a major selloff.
+    parser.add_argument("--allow-crash-recovery", action="store_true")
+    parser.add_argument("--crash-recovery-high-lookback-bars", type=int, default=120)
+    parser.add_argument("--crash-recovery-min-drawdown-pct", type=float, default=15.0)
+    parser.add_argument("--crash-recovery-recent-low-bars", type=int, default=8)
+    parser.add_argument("--crash-recovery-structure-bars", type=int, default=3)
+    parser.add_argument("--crash-recovery-min-rel-volume", type=float, default=1.00)
+    parser.add_argument("--crash-recovery-max-recovery-from-low-pct", type=float, default=8.0)
+    parser.add_argument("--crash-recovery-min-practical-target-pct", type=float, default=1.50)
+    parser.add_argument("--crash-recovery-target-buffer-pct", type=float, default=0.20)
 
     return parser.parse_args()
 
@@ -447,13 +460,19 @@ def reversal_structure(
     return confirmed, higher_low, structure_high
 
 
-def nearest_overhead_resistance(df: pd.DataFrame, entry: float, lookback: int = 40) -> float:
-    """Return the nearest recent high genuinely above entry, if one exists."""
+def nearest_overhead_resistance(
+    df: pd.DataFrame,
+    entry: float,
+    lookback: int = 40,
+    min_distance_pct: float = 0.10,
+) -> float:
+    """Return the nearest meaningful recent high above entry, if one exists."""
     window = df.iloc[-(lookback + 1):-1]
     if window.empty:
         return math.nan
 
-    overhead = window.loc[window["High"] > entry * 1.001, "High"]
+    threshold = entry * (1.0 + max(0.0, min_distance_pct) / 100.0)
+    overhead = window.loc[window["High"] > threshold, "High"]
     return float(overhead.min()) if not overhead.empty else math.nan
 
 
@@ -483,16 +502,29 @@ def make_candidate(
     reason: str,
     signal_phase: str = "Confirmed",
     signal_age_bars: int | None = None,
+    practical_target: float | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    """Build one candidate row.
+
+    ``Target_5pct`` remains the theoretical target implied by the UI. ``Target``
+    can be lower when the pattern deliberately caps the trade at the first
+    meaningful overhead resistance. Reward/risk uses the actual Target.
+    """
     if not np.isfinite(stop) or stop >= entry:
         return None
 
-    target = entry * (1.0 + target_pct / 100.0)
+    theoretical_target = entry * (1.0 + target_pct / 100.0)
+    target = theoretical_target
+    if practical_target is not None and np.isfinite(practical_target) and practical_target > entry:
+        target = min(theoretical_target, float(practical_target))
+
+    effective_target_pct = pct(target, entry)
     risk_pct = (entry - stop) / entry * 100.0
-    reward_risk = target_pct / risk_pct if risk_pct > 0 else math.nan
+    reward_risk = effective_target_pct / risk_pct if risk_pct > 0 else math.nan
     resistance_distance = pct(resistance, entry) if np.isfinite(resistance) else math.nan
 
-    return {
+    result: dict[str, Any] = {
         "Ticker": ticker,
         "Pattern": pattern,
         "SignalPhase": signal_phase,
@@ -502,7 +534,9 @@ def make_candidate(
         "LastCompletedHourlyBar": str(bar.name),
         "Entry": num(entry),
         "Stop": num(stop),
-        "Target_5pct": num(target),
+        "Target": num(target),
+        "Target_pct": num(effective_target_pct),
+        "Target_5pct": num(theoretical_target),
         "Risk_pct": num(risk_pct),
         "RewardRisk_to_Target": num(reward_risk),
         "Close": num(bar["Close"]),
@@ -520,6 +554,9 @@ def make_candidate(
         ),
         "Reason": reason,
     }
+    if extra_fields:
+        result.update(extra_fields)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +707,128 @@ def try_early_recovery(
         ),
         signal_phase="Fresh current-hour recovery",
         signal_age_bars=0,
+    )
+
+
+def try_crash_recovery(
+    df: pd.DataFrame,
+    ticker: str,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Find an early, volume-backed recovery after a meaningful recent drawdown.
+
+    Unlike ``EARLY_RECOVERY``, this setup does *not* require price to reclaim
+    EMA20 or EMA50. It requires a material recent drawdown, a current bullish
+    candle, and a break above the prior few hourly highs. The target is capped
+    at the first meaningful overhead resistance rather than blindly assuming
+    a full 5% continuation through supply.
+    """
+    if not getattr(args, "allow_crash_recovery", False):
+        return None
+
+    high_lookback = max(40, int(getattr(args, "crash_recovery_high_lookback_bars", 120)))
+    recent_low_bars = max(5, int(getattr(args, "crash_recovery_recent_low_bars", 8)))
+    structure_bars = max(2, int(getattr(args, "crash_recovery_structure_bars", 3)))
+
+    prior_high_window = df.iloc[-(high_lookback + 1):-1]
+    recent_low_window = df.iloc[-(recent_low_bars + 1):-1]
+    structure_window = df.iloc[-(structure_bars + 1):-1]
+    if (
+        len(prior_high_window) < high_lookback
+        or len(recent_low_window) < recent_low_bars
+        or len(structure_window) < structure_bars
+    ):
+        return None
+
+    bar = df.iloc[-1]
+    entry = float(bar["Close"])
+    crash_high = float(prior_high_window["High"].max())
+    recent_low = float(recent_low_window["Low"].min())
+    short_structure_high = float(structure_window["High"].max())
+
+    drawdown_from_high = pct(entry, crash_high)
+    recovery_from_low = pct(entry, recent_low)
+    min_drawdown = abs(float(getattr(args, "crash_recovery_min_drawdown_pct", 15.0)))
+    max_recovery = float(getattr(args, "crash_recovery_max_recovery_from_low_pct", 8.0))
+
+    candle_range = max(float(bar["High"] - bar["Low"]), 1e-9)
+    close_location = float((bar["Close"] - bar["Low"]) / candle_range)
+    broke_short_structure = bool(entry > short_structure_high * 1.001)
+    current_bar_bullish = bool(bar["Close"] > bar["Open"] and close_location >= 0.65)
+
+    resistance = nearest_overhead_resistance(
+        df,
+        entry,
+        lookback=min(high_lookback, 80),
+        min_distance_pct=float(
+            getattr(args, "crash_recovery_min_practical_target_pct", 1.50)
+        ),
+    )
+    theoretical_target = entry * (1.0 + args.target_pct / 100.0)
+    practical_target = theoretical_target
+    if np.isfinite(resistance):
+        practical_target = min(
+            theoretical_target,
+            resistance
+            * (
+                1.0
+                - float(getattr(args, "crash_recovery_target_buffer_pct", 0.20))
+                / 100.0
+            ),
+        )
+
+    practical_target_pct = pct(practical_target, entry)
+    min_practical_target = float(
+        getattr(args, "crash_recovery_min_practical_target_pct", 1.50)
+    )
+
+    is_crash_recovery = bool(
+        drawdown_from_high <= -min_drawdown
+        and 0.50 <= recovery_from_low <= max_recovery
+        and current_bar_bullish
+        and broke_short_structure
+        and bar["RelVol20"] >= float(
+            getattr(args, "crash_recovery_min_rel_volume", 1.00)
+        )
+        and practical_target_pct >= min_practical_target
+    )
+    if not is_crash_recovery:
+        return None
+
+    stop = recent_low - 0.15 * bar["ATR14"]
+    score = 54
+    score += 12 if bar["RelVol20"] >= 1.25 else 0
+    score += 10 if drawdown_from_high <= -20.0 else 0
+    score += 8 if recovery_from_low <= 5.0 else 0
+    score += 7 if entry > bar["EMA20"] else 0  # bonus only, never a requirement
+    score += 5 if entry > df.iloc[-2]["High"] else 0
+
+    return make_candidate(
+        ticker=ticker,
+        pattern="CRASH_RECOVERY",
+        score=score,
+        bar=bar,
+        entry=entry,
+        stop=float(stop),
+        target_pct=args.target_pct,
+        support=recent_low,
+        resistance=resistance,
+        reason=(
+            "A materially sold-off name broke short hourly structure on a bullish, "
+            "volume-backed recovery bar. EMA20/EMA50 reclaim is not required; "
+            "the displayed target is capped at the first meaningful overhead resistance."
+        ),
+        signal_phase="Fresh post-crash recovery",
+        signal_age_bars=0,
+        practical_target=float(practical_target),
+        extra_fields={
+            "CrashHigh": num(crash_high),
+            "DrawdownFromCrashHigh_pct": num(drawdown_from_high),
+            "RecentLow": num(recent_low),
+            "RecoveryFromRecentLow_pct": num(recovery_from_low),
+            "ShortStructureHigh": num(short_structure_high),
+            "EMA20Required": False,
+        },
     )
 
 
@@ -881,7 +1040,15 @@ def classify_ticker(
     is_breakdown, breakdown_support = breakdown_level(df)
     is_reversal, higher_low, local_structure = reversal_structure(df, args)
 
-    if is_breakdown:
+    # Evaluate the crash-recovery candidate before downtrend/breakdown exclusion.
+    # A genuine early recovery is often still below EMA20/EMA50 and would otherwise
+    # be discarded by the confirmation-first state classifier.
+    crash_recovery_candidate = try_crash_recovery(df, ticker, args)
+    crash_recovery = crash_recovery_candidate is not None
+
+    if crash_recovery:
+        primary_state = "CRASH_RECOVERY"
+    elif is_breakdown:
         primary_state = "BREAKDOWN"
     elif is_reversal:
         primary_state = "REVERSAL_CONFIRM"
@@ -911,6 +1078,7 @@ def classify_ticker(
         "Breakout": is_breakout,
         "Breakdown": is_breakdown,
         "Reversal": is_reversal,
+        "CrashRecovery": crash_recovery,
         "RangeSupport": num(range_support),
         "RangeResistance": num(range_resistance),
         "BreakoutResistance": num(breakout_resistance),
@@ -918,7 +1086,7 @@ def classify_ticker(
         "Reason": "",
     }
 
-    # Safeguards apply to both fresh and confirmed profiles.
+    # Safeguards apply to every profile.
     if bar["Close"] < args.min_price:
         debug["Reason"] = f"Below minimum price (${args.min_price:.2f})"
         return None, debug
@@ -928,14 +1096,15 @@ def classify_ticker(
     if bar["RelVol20"] < args.min_rel_volume:
         debug["Reason"] = "Current relative volume below threshold"
         return None, debug
-    if is_breakdown:
+    if is_breakdown and not crash_recovery:
         debug["Reason"] = "Breakdown state: no long entry"
         return None, debug
-    if downtrend and not is_reversal:
+    if downtrend and not is_reversal and not crash_recovery:
         debug["Reason"] = "Downtrend state: no long entry"
         return None, debug
 
     choices = [
+        crash_recovery_candidate,
         try_fresh_breakout(df, ticker, args),
         try_early_recovery(df, ticker, args),
         try_breakout_retest(df, ticker, args),
@@ -961,15 +1130,17 @@ def classify_ticker(
         debug["Reason"] = "No complete long-entry setup passed active filters"
         return None, debug
 
-    # Fresh signals come first in the tie-break only when their score is equal;
-    # this preserves a higher-quality confirmed setup when it is objectively stronger.
     selected = max(
         candidates,
         key=lambda row: (
             row["Score"],
             row["RewardRisk_to_Target"],
             row["RelVol20"],
-            -int(row.get("SignalAgeBars", 99) if np.isfinite(row.get("SignalAgeBars", math.nan)) else 99),
+            -int(
+                row.get("SignalAgeBars", 99)
+                if np.isfinite(row.get("SignalAgeBars", math.nan))
+                else 99
+            ),
         ),
     )
     debug["Reason"] = f"Selected {selected['Pattern']}"
@@ -1004,6 +1175,7 @@ def main() -> None:
         "Signals: "
         f"fresh-breakout={'ON' if args.allow_fresh_breakout else 'OFF'}; "
         f"early-recovery={'ON' if args.allow_early_recovery else 'OFF'}; "
+        f"crash-recovery={'ON' if args.allow_crash_recovery else 'OFF'}; "
         f"continuation={'ON' if args.allow_uptrend_continuation else 'OFF'}"
     )
 
@@ -1054,9 +1226,11 @@ def main() -> None:
 
     result_columns = [
         "Ticker", "Pattern", "SignalPhase", "SignalAgeBars", "Action", "Score", "LastCompletedHourlyBar",
-        "Entry", "Stop", "Target_5pct", "Risk_pct", "RewardRisk_to_Target", "Close", "EMA20", "EMA50",
-        "Distance_to_EMA20_pct", "Distance_to_EMA50_pct", "RelVol20", "AvgHourlyDollarVol20", "Support",
-        "Resistance", "ResistanceDistance_pct", "ResistanceBefore5pctTarget", "Reason",
+        "Entry", "Stop", "Target", "Target_pct", "Target_5pct", "Risk_pct", "RewardRisk_to_Target",
+        "Close", "EMA20", "EMA50", "Distance_to_EMA20_pct", "Distance_to_EMA50_pct", "RelVol20",
+        "AvgHourlyDollarVol20", "Support", "Resistance", "ResistanceDistance_pct",
+        "ResistanceBefore5pctTarget", "CrashHigh", "DrawdownFromCrashHigh_pct", "RecentLow",
+        "RecoveryFromRecentLow_pct", "ShortStructureHigh", "EMA20Required", "Reason",
     ]
     output_file = args.outdir / "good_entries.csv"
     write_csv(good_entries, output_file, result_columns)
@@ -1072,7 +1246,7 @@ def main() -> None:
     else:
         display = pd.DataFrame(good_entries)[
             [
-                "Ticker", "Pattern", "SignalPhase", "Score", "Entry", "Stop", "Target_5pct",
+                "Ticker", "Pattern", "SignalPhase", "Score", "Entry", "Stop", "Target", "Target_pct",
                 "Risk_pct", "RewardRisk_to_Target", "RelVol20", "ResistanceDistance_pct",
                 "ResistanceBefore5pctTarget",
             ]
