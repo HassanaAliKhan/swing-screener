@@ -107,6 +107,11 @@ def parse_args() -> argparse.Namespace:
     # Deep-crash recovery. This is intentionally independent of EMA20/EMA50
     # placement so it can surface the first structure break after a major selloff.
     parser.add_argument("--allow-crash-recovery", action="store_true")
+    parser.add_argument(
+        "--crash-recovery-only",
+        action="store_true",
+        help="When set, only emit CRASH_RECOVERY candidates; do not let legacy momentum patterns compete.",
+    )
     parser.add_argument("--crash-recovery-high-lookback-bars", type=int, default=120)
     parser.add_argument("--crash-recovery-min-drawdown-pct", type=float, default=15.0)
     parser.add_argument("--crash-recovery-recent-low-bars", type=int, default=8)
@@ -350,6 +355,15 @@ def pct(value: float, reference: float) -> float:
 
 def num(value: float, digits: int = 2) -> float:
     return round(float(value), digits) if np.isfinite(value) else math.nan
+
+
+def safe_float_for_sort(value: Any, default: float = math.inf) -> float:
+    """Return a deterministic numeric sort value for candidate diagnostics."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if np.isfinite(parsed) else default
 
 
 def bullish_confirmation(bar: pd.Series, allow_neutral: bool) -> bool:
@@ -742,8 +756,18 @@ def try_crash_recovery(
 
     bar = df.iloc[-1]
     entry = float(bar["Close"])
-    crash_high = float(prior_high_window["High"].max())
-    recent_low = float(recent_low_window["Low"].min())
+
+    # Use the highest hourly high *before the selected recovery low*. This is a
+    # more useful crash reference than a generic rolling high because it cannot
+    # accidentally point to a rebound peak formed after the trough. It remains
+    # limited to the user-selected hourly lookback and is not a literal ATH.
+    recent_low_bar = recent_low_window["Low"].idxmin()
+    recent_low = float(recent_low_window.loc[recent_low_bar, "Low"])
+    pre_crash_window = prior_high_window.loc[prior_high_window.index <= recent_low_bar]
+    if pre_crash_window.empty:
+        return None
+    highest_before_crash_bar = pre_crash_window["High"].idxmax()
+    crash_high = float(pre_crash_window.loc[highest_before_crash_bar, "High"])
     short_structure_high = float(structure_window["High"].max())
 
     drawdown_from_high = pct(entry, crash_high)
@@ -814,20 +838,29 @@ def try_crash_recovery(
         support=recent_low,
         resistance=resistance,
         reason=(
-            "A materially sold-off name broke short hourly structure on a bullish, "
-            "volume-backed recovery bar. EMA20/EMA50 reclaim is not required; "
-            "the displayed target is capped at the first meaningful overhead resistance."
+            "A deeply sold-off name made its first bullish hourly short-structure break "
+            "on volume. This profile rejects near-high momentum names and does not require "
+            "an EMA20/EMA50 reclaim; the displayed target is capped at overhead resistance."
         ),
         signal_phase="Fresh post-crash recovery",
         signal_age_bars=0,
         practical_target=float(practical_target),
         extra_fields={
+            # ``CrashHigh`` is retained for compatibility with prior exports.
+            # ``HighestBeforeCrash`` is the user-facing name and includes the
+            # timestamp so the reference can be checked on the chart.
             "CrashHigh": num(crash_high),
+            "CrashHighBar": str(highest_before_crash_bar),
+            "HighestBeforeCrash": num(crash_high),
+            "HighestBeforeCrashBar": str(highest_before_crash_bar),
+            "HighReferenceLookbackBars": int(high_lookback),
             "DrawdownFromCrashHigh_pct": num(drawdown_from_high),
             "RecentLow": num(recent_low),
+            "RecentLowBar": str(recent_low_bar),
             "RecoveryFromRecentLow_pct": num(recovery_from_low),
             "ShortStructureHigh": num(short_structure_high),
             "EMA20Required": False,
+            "CrashRecoveryOnly": bool(getattr(args, "crash_recovery_only", False)),
         },
     )
 
@@ -1079,6 +1112,7 @@ def classify_ticker(
         "Breakdown": is_breakdown,
         "Reversal": is_reversal,
         "CrashRecovery": crash_recovery,
+        "CrashRecoveryOnly": bool(getattr(args, "crash_recovery_only", False)),
         "RangeSupport": num(range_support),
         "RangeResistance": num(range_resistance),
         "BreakoutResistance": num(breakout_resistance),
@@ -1103,16 +1137,21 @@ def classify_ticker(
         debug["Reason"] = "Downtrend state: no long entry"
         return None, debug
 
-    choices = [
-        crash_recovery_candidate,
-        try_fresh_breakout(df, ticker, args),
-        try_early_recovery(df, ticker, args),
-        try_breakout_retest(df, ticker, args),
-        try_uptrend_pullback(df, ticker, args),
-        try_uptrend_continuation(df, ticker, args),
-        try_range_support_bounce(df, ticker, args),
-        try_reversal_confirm(df, ticker, args),
-    ]
+    if getattr(args, "crash_recovery_only", False):
+        # This is critical: the crash-recovery profile must never return an ATH/
+        # momentum continuation just because it received a higher legacy score.
+        choices = [crash_recovery_candidate]
+    else:
+        choices = [
+            crash_recovery_candidate,
+            try_fresh_breakout(df, ticker, args),
+            try_early_recovery(df, ticker, args),
+            try_breakout_retest(df, ticker, args),
+            try_uptrend_pullback(df, ticker, args),
+            try_uptrend_continuation(df, ticker, args),
+            try_range_support_bounce(df, ticker, args),
+            try_reversal_confirm(df, ticker, args),
+        ]
 
     candidates: list[dict[str, Any]] = []
     for row in choices:
@@ -1176,6 +1215,7 @@ def main() -> None:
         f"fresh-breakout={'ON' if args.allow_fresh_breakout else 'OFF'}; "
         f"early-recovery={'ON' if args.allow_early_recovery else 'OFF'}; "
         f"crash-recovery={'ON' if args.allow_crash_recovery else 'OFF'}; "
+        f"crash-only={'ON' if getattr(args, 'crash_recovery_only', False) else 'OFF'}; "
         f"continuation={'ON' if args.allow_uptrend_continuation else 'OFF'}"
     )
 
@@ -1219,10 +1259,19 @@ def main() -> None:
         except Exception as exc:
             errors.append({"Ticker": ticker, "Error": f"Classification error: {type(exc).__name__}: {exc}"})
 
-    good_entries.sort(
-        key=lambda row: (row["Score"], row["RewardRisk_to_Target"], row["RelVol20"]),
-        reverse=True,
-    )
+    if getattr(args, "crash_recovery_only", False):
+        good_entries.sort(
+            key=lambda row: (
+                safe_float_for_sort(row.get("DrawdownFromCrashHigh_pct")),
+                safe_float_for_sort(row.get("RecoveryFromRecentLow_pct")),
+                -safe_float_for_sort(row.get("RelVol20")),
+            )
+        )
+    else:
+        good_entries.sort(
+            key=lambda row: (row["Score"], row["RewardRisk_to_Target"], row["RelVol20"]),
+            reverse=True,
+        )
 
     result_columns = [
         "Ticker", "Pattern", "SignalPhase", "SignalAgeBars", "Action", "Score", "LastCompletedHourlyBar",
