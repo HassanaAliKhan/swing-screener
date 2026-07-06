@@ -112,13 +112,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="When set, only emit CRASH_RECOVERY candidates; do not let legacy momentum patterns compete.",
     )
-    parser.add_argument("--crash-recovery-high-lookback-bars", type=int, default=120)
-    parser.add_argument("--crash-recovery-min-drawdown-pct", type=float, default=15.0)
-    parser.add_argument("--crash-recovery-recent-low-bars", type=int, default=8)
+    parser.add_argument("--crash-recovery-high-lookback-bars", type=int, default=300)
+    parser.add_argument("--crash-recovery-min-drawdown-pct", type=float, default=20.0)
+    parser.add_argument(
+        "--crash-recovery-low-lookback-bars",
+        type=int,
+        default=80,
+        help="Search this many completed hourly bars for the crash low used as the recovery reference.",
+    )
+    parser.add_argument(
+        "--crash-recovery-signal-lookback-bars",
+        type=int,
+        default=8,
+        help="Allow the initial recovery trigger to have occurred within this many completed hourly bars.",
+    )
+    parser.add_argument("--crash-recovery-min-recovery-from-low-pct", type=float, default=2.0)
     parser.add_argument("--crash-recovery-structure-bars", type=int, default=3)
-    parser.add_argument("--crash-recovery-min-rel-volume", type=float, default=1.00)
-    parser.add_argument("--crash-recovery-max-recovery-from-low-pct", type=float, default=8.0)
-    parser.add_argument("--crash-recovery-min-practical-target-pct", type=float, default=1.50)
+    parser.add_argument("--crash-recovery-min-positive-bars", type=int, default=3)
+    parser.add_argument("--crash-recovery-min-rel-volume", type=float, default=0.70)
+    parser.add_argument("--crash-recovery-max-recovery-from-low-pct", type=float, default=35.0)
+    parser.add_argument("--crash-recovery-min-practical-target-pct", type=float, default=0.50)
     parser.add_argument("--crash-recovery-target-buffer-pct", type=float, default=0.20)
 
     return parser.parse_args()
@@ -326,6 +339,9 @@ def fetch_hourly(
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    # EMA8 is used only to recognize that a post-crash rebound is still active.
+    # It is intentionally not a substitute for the slower EMA20/EMA50 trend filters.
+    out["EMA8"] = out["Close"].ewm(span=8, adjust=False).mean()
     out["EMA20"] = out["Close"].ewm(span=20, adjust=False).mean()
     out["EMA50"] = out["Close"].ewm(span=50, adjust=False).mean()
 
@@ -342,6 +358,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["AvgVol20"] = out["Volume"].rolling(20).mean()
     out["RelVol20"] = out["Volume"] / out["AvgVol20"].replace(0, np.nan)
     out["AvgDollarVol20"] = (out["Close"] * out["Volume"]).rolling(20).mean()
+    out["EMA8Slope3"] = out["EMA8"] - out["EMA8"].shift(3)
     out["EMA20Slope5"] = out["EMA20"] - out["EMA20"].shift(5)
     out["EMA50Slope8"] = out["EMA50"] - out["EMA50"].shift(8)
     return out.dropna().copy()
@@ -724,69 +741,149 @@ def try_early_recovery(
     )
 
 
+def _recent_structure_triggers(
+    df: pd.DataFrame,
+    structure_bars: int,
+    signal_lookback: int,
+) -> list[int]:
+    """Return hourly-bar positions that broke the immediately preceding local high.
+
+    The old crash profile required the breakout to happen on the *single latest*
+    completed hourly bar. That is too fragile for a watchlist: a stock can make
+    the first break, consolidate for a few hours, and still be in the desired
+    early recovery phase. This helper preserves the price-structure idea but
+    allows that trigger to be recent rather than exactly one bar old.
+    """
+    triggers: list[int] = []
+    start = max(structure_bars, len(df) - max(2, signal_lookback))
+    for pos in range(start, len(df)):
+        bar = df.iloc[pos]
+        prior = df.iloc[pos - structure_bars:pos]
+        if prior.empty:
+            continue
+        prior_high = float(prior["High"].max())
+        candle_range = max(float(bar["High"] - bar["Low"]), 1e-9)
+        close_location = float((bar["Close"] - bar["Low"]) / candle_range)
+        bullish = bool(bar["Close"] > bar["Open"] and close_location >= 0.55)
+        if bullish and float(bar["Close"]) > prior_high * 1.001:
+            triggers.append(pos)
+    return triggers
+
+
 def try_crash_recovery(
     df: pd.DataFrame,
     ticker: str,
     args: argparse.Namespace,
 ) -> dict[str, Any] | None:
-    """Find an early, volume-backed recovery after a meaningful recent drawdown.
+    """Build a ranked deep-recovery watchlist rather than requiring a perfect entry candle.
 
-    Unlike ``EARLY_RECOVERY``, this setup does *not* require price to reclaim
-    EMA20 or EMA50. It requires a material recent drawdown, a current bullish
-    candle, and a break above the prior few hourly highs. The target is capped
-    at the first meaningful overhead resistance rather than blindly assuming
-    a full 5% continuation through supply.
+    Earlier versions required the crash low to be extremely recent *and* the
+    latest completed hour to break structure on elevated volume. That is valid
+    for a narrow entry trigger, but it frequently produces a zero-row scan.
+
+    This version keeps the central idea—still materially below the pre-crash
+    high and demonstrably above the recent trough—but separates *recovery state*
+    from *entry readiness*:
+      - WATCH: early rebound; wait for structure confirmation.
+      - BUILDING: constructive rebound or a recent prior trigger.
+      - TRIGGERED: the latest completed hour breaks short structure.
+
+    Every row remains a review candidate, not an automatic buy signal.
     """
     if not getattr(args, "allow_crash_recovery", False):
         return None
 
-    high_lookback = max(40, int(getattr(args, "crash_recovery_high_lookback_bars", 120)))
-    recent_low_bars = max(5, int(getattr(args, "crash_recovery_recent_low_bars", 8)))
+    high_lookback = max(80, int(getattr(args, "crash_recovery_high_lookback_bars", 300)))
+    low_lookback = max(30, int(getattr(args, "crash_recovery_low_lookback_bars", 120)))
+    signal_lookback = max(4, int(getattr(args, "crash_recovery_signal_lookback_bars", 12)))
     structure_bars = max(2, int(getattr(args, "crash_recovery_structure_bars", 3)))
+    min_positive_bars = max(1, int(getattr(args, "crash_recovery_min_positive_bars", 2)))
 
-    prior_high_window = df.iloc[-(high_lookback + 1):-1]
-    recent_low_window = df.iloc[-(recent_low_bars + 1):-1]
-    structure_window = df.iloc[-(structure_bars + 1):-1]
-    if (
-        len(prior_high_window) < high_lookback
-        or len(recent_low_window) < recent_low_bars
-        or len(structure_window) < structure_bars
-    ):
+    high_window = df.iloc[-(high_lookback + 1):-1]
+    low_window = df.iloc[-(low_lookback + 1):-1]
+    if len(high_window) < high_lookback or len(low_window) < low_lookback:
         return None
 
     bar = df.iloc[-1]
     entry = float(bar["Close"])
 
-    # Use the highest hourly high *before the selected recovery low*. This is a
-    # more useful crash reference than a generic rolling high because it cannot
-    # accidentally point to a rebound peak formed after the trough. It remains
-    # limited to the user-selected hourly lookback and is not a literal ATH.
-    recent_low_bar = recent_low_window["Low"].idxmin()
-    recent_low = float(recent_low_window.loc[recent_low_bar, "Low"])
-    pre_crash_window = prior_high_window.loc[prior_high_window.index <= recent_low_bar]
+    # The high reference is strictly before the selected trough, so it cannot
+    # use a rebound peak after the crash low.
+    crash_low_bar = low_window["Low"].idxmin()
+    crash_low = float(low_window.loc[crash_low_bar, "Low"])
+    pre_crash_window = high_window.loc[high_window.index <= crash_low_bar]
     if pre_crash_window.empty:
         return None
     highest_before_crash_bar = pre_crash_window["High"].idxmax()
     crash_high = float(pre_crash_window.loc[highest_before_crash_bar, "High"])
-    short_structure_high = float(structure_window["High"].max())
 
     drawdown_from_high = pct(entry, crash_high)
-    recovery_from_low = pct(entry, recent_low)
-    min_drawdown = abs(float(getattr(args, "crash_recovery_min_drawdown_pct", 15.0)))
-    max_recovery = float(getattr(args, "crash_recovery_max_recovery_from_low_pct", 8.0))
+    recovery_from_low = pct(entry, crash_low)
+    min_drawdown = abs(float(getattr(args, "crash_recovery_min_drawdown_pct", 20.0)))
+    min_recovery = max(0.0, float(getattr(args, "crash_recovery_min_recovery_from_low_pct", 1.0)))
+    max_recovery = float(getattr(args, "crash_recovery_max_recovery_from_low_pct", 45.0))
 
-    candle_range = max(float(bar["High"] - bar["Low"]), 1e-9)
-    close_location = float((bar["Close"] - bar["Low"]) / candle_range)
-    broke_short_structure = bool(entry > short_structure_high * 1.001)
-    current_bar_bullish = bool(bar["Close"] > bar["Open"] and close_location >= 0.65)
+    # Recovery-state diagnostics—not all are hard filters.
+    trigger_positions = _recent_structure_triggers(
+        df=df,
+        structure_bars=structure_bars,
+        signal_lookback=signal_lookback,
+    )
+    latest_trigger_pos = trigger_positions[-1] if trigger_positions else None
+    trigger_freshness = (
+        len(df) - 1 - latest_trigger_pos
+        if latest_trigger_pos is not None
+        else math.nan
+    )
+    current_trigger = bool(latest_trigger_pos == len(df) - 1)
+
+    signal_window = df.iloc[-signal_lookback:]
+    positive_bars = int((signal_window["Close"] > signal_window["Open"]).sum())
+    recent_return = pct(entry, float(signal_window.iloc[0]["Close"]))
+    recent_max_relvol = float(signal_window["RelVol20"].max())
+    ema8_rising = bool(float(bar["EMA8"]) >= float(df.iloc[-4]["EMA8"]))
+    above_ema8 = bool(entry >= float(bar["EMA8"]) * 0.995)
+    building = bool(
+        positive_bars >= min_positive_bars
+        and (above_ema8 or ema8_rising or recent_return >= 0.50)
+    )
+
+    # The only hard signal requirement is that the stock is actually off its
+    # selected trough. WATCH rows may be early, but do not represent a falling
+    # name that has not bounced at all.
+    early_rebound = bool(recovery_from_low >= min_recovery)
+    if not (
+        drawdown_from_high <= -min_drawdown
+        and early_rebound
+        and recovery_from_low <= max_recovery
+    ):
+        return None
+
+    if current_trigger:
+        recovery_status = "TRIGGERED"
+        action = "ENTRY_REVIEW"
+        entry_readiness = "Latest completed hour broke the prior short-term high."
+    elif latest_trigger_pos is not None or building:
+        recovery_status = "BUILDING"
+        action = "WAIT_FOR_TRIGGER"
+        entry_readiness = "Recovery is constructive; wait for a fresh short-term high break."
+    else:
+        recovery_status = "WATCH"
+        action = "WATCH_ONLY"
+        entry_readiness = "Early rebound only; no usable short-term trigger yet."
+
+    # Use nearby recovery support for a manageable reference stop, not the
+    # original crash low. This is displayed even for WATCH rows and is not a
+    # claim that the position should be opened now.
+    short_support_window = df.iloc[-(signal_lookback + 1):-1]
+    short_support = float(short_support_window["Low"].min())
+    stop = short_support - 0.20 * float(bar["ATR14"])
 
     resistance = nearest_overhead_resistance(
         df,
         entry,
-        lookback=min(high_lookback, 80),
-        min_distance_pct=float(
-            getattr(args, "crash_recovery_min_practical_target_pct", 1.50)
-        ),
+        lookback=min(high_lookback, 120),
+        min_distance_pct=0.25,
     )
     theoretical_target = entry * (1.0 + args.target_pct / 100.0)
     practical_target = theoretical_target
@@ -801,33 +898,15 @@ def try_crash_recovery(
             ),
         )
 
-    practical_target_pct = pct(practical_target, entry)
-    min_practical_target = float(
-        getattr(args, "crash_recovery_min_practical_target_pct", 1.50)
-    )
+    score = 40
+    score += 15 if recovery_status == "TRIGGERED" else 8 if recovery_status == "BUILDING" else 0
+    score += 10 if drawdown_from_high <= -30.0 else 0
+    score += 7 if drawdown_from_high <= -45.0 else 0
+    score += 6 if recovery_from_low <= 15.0 else 0
+    score += 5 if recent_max_relvol >= 1.00 else 0
+    score += 3 if entry > float(bar["EMA20"]) else 0
 
-    is_crash_recovery = bool(
-        drawdown_from_high <= -min_drawdown
-        and 0.50 <= recovery_from_low <= max_recovery
-        and current_bar_bullish
-        and broke_short_structure
-        and bar["RelVol20"] >= float(
-            getattr(args, "crash_recovery_min_rel_volume", 1.00)
-        )
-        and practical_target_pct >= min_practical_target
-    )
-    if not is_crash_recovery:
-        return None
-
-    stop = recent_low - 0.15 * bar["ATR14"]
-    score = 54
-    score += 12 if bar["RelVol20"] >= 1.25 else 0
-    score += 10 if drawdown_from_high <= -20.0 else 0
-    score += 8 if recovery_from_low <= 5.0 else 0
-    score += 7 if entry > bar["EMA20"] else 0  # bonus only, never a requirement
-    score += 5 if entry > df.iloc[-2]["High"] else 0
-
-    return make_candidate(
+    result = make_candidate(
         ticker=ticker,
         pattern="CRASH_RECOVERY",
         score=score,
@@ -835,34 +914,48 @@ def try_crash_recovery(
         entry=entry,
         stop=float(stop),
         target_pct=args.target_pct,
-        support=recent_low,
+        support=short_support,
         resistance=resistance,
         reason=(
-            "A deeply sold-off name made its first bullish hourly short-structure break "
-            "on volume. This profile rejects near-high momentum names and does not require "
-            "an EMA20/EMA50 reclaim; the displayed target is capped at overhead resistance."
+            "Stock remains materially below its pre-crash high and has bounced "
+            "from a recent trough. RecoveryStatus distinguishes an early watch "
+            "from a building recovery and a current-hour entry trigger."
         ),
-        signal_phase="Fresh post-crash recovery",
-        signal_age_bars=0,
+        signal_phase=f"Crash recovery — {recovery_status.title()}",
+        signal_age_bars=(
+            int(trigger_freshness) if np.isfinite(trigger_freshness) else math.nan
+        ),
         practical_target=float(practical_target),
         extra_fields={
-            # ``CrashHigh`` is retained for compatibility with prior exports.
-            # ``HighestBeforeCrash`` is the user-facing name and includes the
-            # timestamp so the reference can be checked on the chart.
-            "CrashHigh": num(crash_high),
-            "CrashHighBar": str(highest_before_crash_bar),
+            "Action": action,
+            "RecoveryStatus": recovery_status,
+            "EntryReadiness": entry_readiness,
             "HighestBeforeCrash": num(crash_high),
             "HighestBeforeCrashBar": str(highest_before_crash_bar),
             "HighReferenceLookbackBars": int(high_lookback),
+            "CrashLow": num(crash_low),
+            "CrashLowBar": str(crash_low_bar),
+            "CrashLowLookbackBars": int(low_lookback),
             "DrawdownFromCrashHigh_pct": num(drawdown_from_high),
-            "RecentLow": num(recent_low),
-            "RecentLowBar": str(recent_low_bar),
-            "RecoveryFromRecentLow_pct": num(recovery_from_low),
-            "ShortStructureHigh": num(short_structure_high),
+            "RecoveryFromCrashLow_pct": num(recovery_from_low),
+            "RecoveryStage": recovery_status,
+            "RecoveryTriggerFreshnessBars": (
+                int(trigger_freshness) if np.isfinite(trigger_freshness) else math.nan
+            ),
+            "RecentPositiveBars": positive_bars,
+            "RecentMaxRelVol20": num(recent_max_relvol),
+            "VolumeConfirmed": bool(recent_max_relvol >= 1.00),
+            "ShortTermSupport": num(short_support),
+            "ShortStructureHigh": num(
+                float(df.iloc[-(structure_bars + 1):-1]["High"].max())
+            ),
             "EMA20Required": False,
-            "CrashRecoveryOnly": bool(getattr(args, "crash_recovery_only", False)),
+            "CrashRecoveryOnly": bool(
+                getattr(args, "crash_recovery_only", False)
+            ),
         },
     )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1220,10 @@ def classify_ticker(
     if bar["AvgDollarVol20"] < args.min_hourly_dollar_volume:
         debug["Reason"] = "Insufficient average hourly dollar volume"
         return None, debug
-    if bar["RelVol20"] < args.min_rel_volume:
+    # Crash recovery evaluates the strongest volume confirmation in the recent
+    # recovery window. Requiring the exact current bar to clear the global
+    # relative-volume gate was another source of false zero-result scans.
+    if bar["RelVol20"] < args.min_rel_volume and not getattr(args, "crash_recovery_only", False):
         debug["Reason"] = "Current relative volume below threshold"
         return None, debug
     if is_breakdown and not crash_recovery:
@@ -1156,6 +1252,12 @@ def classify_ticker(
     candidates: list[dict[str, Any]] = []
     for row in choices:
         if row is None:
+            continue
+        if getattr(args, "crash_recovery_only", False):
+            # This is a ranked recovery watchlist. Risk is displayed for review,
+            # but it is not a rejection gate because WATCH/BUILDING rows are not
+            # instructions to enter immediately.
+            candidates.append(row)
             continue
         if row["Score"] < args.min_score:
             continue
@@ -1260,11 +1362,13 @@ def main() -> None:
             errors.append({"Ticker": ticker, "Error": f"Classification error: {type(exc).__name__}: {exc}"})
 
     if getattr(args, "crash_recovery_only", False):
+        _status_rank = {"TRIGGERED": 0, "BUILDING": 1, "WATCH": 2}
         good_entries.sort(
             key=lambda row: (
+                _status_rank.get(str(row.get("RecoveryStatus", "WATCH")), 3),
                 safe_float_for_sort(row.get("DrawdownFromCrashHigh_pct")),
-                safe_float_for_sort(row.get("RecoveryFromRecentLow_pct")),
-                -safe_float_for_sort(row.get("RelVol20")),
+                safe_float_for_sort(row.get("RecoveryFromCrashLow_pct")),
+                -safe_float_for_sort(row.get("RecentMaxRelVol20")),
             )
         )
     else:
