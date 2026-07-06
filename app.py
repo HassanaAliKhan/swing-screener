@@ -18,7 +18,60 @@ st.set_page_config(
 )
 
 
+CRASH_RECOVERY_DEFAULTS: dict[str, Any] = {
+    "allow_crash_recovery": False,
+    "crash_recovery_high_lookback_bars": 120,
+    "crash_recovery_min_drawdown_pct": 15.0,
+    "crash_recovery_recent_low_bars": 8,
+    "crash_recovery_structure_bars": 3,
+    "crash_recovery_min_rel_volume": 1.00,
+    "crash_recovery_max_recovery_from_low_pct": 8.0,
+    "crash_recovery_min_practical_target_pct": 1.50,
+    "crash_recovery_target_buffer_pct": 0.20,
+}
+
+
 PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
+    "Crash recovery": {
+        "min_score": 55,
+        "max_risk_pct": 5.0,
+        "min_reward_risk": 0.85,
+        "min_rel_volume": 0.75,
+        "min_hourly_dollar_volume": 150_000,
+        "min_price": 3.00,
+        "pullback_touch_pct": 2.0,
+        "pullback_max_ema20_distance_pct": 2.0,
+        "pullback_volume_multiplier": 1.20,
+        "breakout_event_volume_multiplier": 1.10,
+        "breakout_retest_tolerance_pct": 2.0,
+        "breakout_max_extension_pct": 2.0,
+        "range_support_distance_pct": 2.0,
+        "reversal_higher_low_pct": 0.25,
+        "reversal_structure_break_pct": 0.10,
+        "reversal_min_rel_volume": 0.90,
+        "allow_resistance_before_target": True,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": True,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
+        "allow_crash_recovery": True,
+        "crash_recovery_high_lookback_bars": 120,
+        "crash_recovery_min_drawdown_pct": 15.0,
+        "crash_recovery_recent_low_bars": 8,
+        "crash_recovery_structure_bars": 3,
+        "crash_recovery_min_rel_volume": 1.00,
+        "crash_recovery_max_recovery_from_low_pct": 8.0,
+        "crash_recovery_min_practical_target_pct": 1.50,
+        "crash_recovery_target_buffer_pct": 0.20,
+    },
     "Fresh momentum": {
         "min_score": 60,
         "max_risk_pct": 3.75,
@@ -205,7 +258,8 @@ def build_args(
     custom_rel_volume: float,
     custom_min_score: int,
 ) -> SimpleNamespace:
-    settings = dict(PROFILE_SETTINGS[profile])
+    settings = dict(CRASH_RECOVERY_DEFAULTS)
+    settings.update(PROFILE_SETTINGS[profile])
     settings["target_pct"] = float(target_pct)
     settings["min_rel_volume"] = float(custom_rel_volume)
     settings["min_score"] = int(custom_min_score)
@@ -303,20 +357,20 @@ def dataframe_csv(df: pd.DataFrame) -> bytes:
 
 st.title("Hourly Swing Screener")
 st.caption(
-    "On-demand 60-minute scan. Fresh momentum finds the first completed-hour "
-    "breakout/reclaim; confirmed profiles wait for more trend proof."
+    "On-demand 60-minute scan. Crash recovery finds the first volume-backed "
+    "structure break after a major recent selloff; other profiles focus on momentum confirmation."
 )
 
 if "watchlist_text" not in st.session_state:
     st.session_state.watchlist_text = default_watchlist()
 
 if "profile_select" not in st.session_state:
-    st.session_state.profile_select = "Fresh momentum — broader"
+    st.session_state.profile_select = "Crash recovery"
 if "min_score_control" not in st.session_state:
-    st.session_state.min_score_control = int(PROFILE_SETTINGS["Fresh momentum — broader"]["min_score"])
+    st.session_state.min_score_control = int(PROFILE_SETTINGS["Crash recovery"]["min_score"])
 if "min_rel_volume_control" not in st.session_state:
     st.session_state.min_rel_volume_control = float(
-        PROFILE_SETTINGS["Fresh momentum — broader"]["min_rel_volume"]
+        PROFILE_SETTINGS["Crash recovery"]["min_rel_volume"]
     )
 
 def reset_profile_controls() -> None:
@@ -347,6 +401,7 @@ with st.expander("Watchlist and scan settings", expanded=False):
         profile = st.selectbox(
             "Scan profile",
             options=[
+                "Crash recovery",
                 "Fresh momentum",
                 "Fresh momentum — broader",
                 "Balanced",
@@ -356,8 +411,9 @@ with st.expander("Watchlist and scan settings", expanded=False):
             key="profile_select",
             on_change=reset_profile_controls,
             help=(
-                "Fresh momentum is the stricter early-signal mode. Fresh momentum — broader "
-                "uses shorter bases, lower volume thresholds, and allows nearby resistance for a larger review list."
+                "Crash recovery finds deeply sold-off names making their first short-structure break; "
+                "it does not require an EMA20 reclaim. Fresh momentum profiles focus on early breakouts; "
+                "confirmed profiles wait for more trend proof."
             ),
         )
     with controls_2:
@@ -398,7 +454,13 @@ with st.expander("Watchlist and scan settings", expanded=False):
 
     show_debug = st.checkbox("Show classifications and data errors after scan", value=True)
 
-    if profile.startswith("Fresh momentum"):
+    if profile == "Crash recovery":
+        st.caption(
+            "Crash recovery requires a meaningful recent hourly drawdown, a bullish current-hour "
+            "short-structure break, and volume confirmation. It deliberately does not require price above EMA20/EMA50. "
+            "Its target is capped at the first meaningful overhead resistance."
+        )
+    elif profile.startswith("Fresh momentum"):
         st.caption(
             "Fresh momentum profiles only accept signals from the latest completed hourly bar. "
             "The broader mode gives more early ideas but has more false starts; it is not for automatic orders."
@@ -472,7 +534,8 @@ st.subheader("Good long-entry candidates")
 if good_entries.empty:
     st.warning(
         "No names passed the selected rules. This is normal; do not force trades. "
-        "Use Fresh momentum for early movement ideas and Balanced/Strict for confirmation."
+        "Use Crash recovery for deep-selloff rebounds, Fresh momentum for early breakouts, "
+        "and Balanced/Strict for later confirmation."
     )
 else:
     display_columns = [
@@ -483,10 +546,13 @@ else:
         "LastCompletedHourlyBar",
         "Entry",
         "Stop",
-        "Target_5pct",
+        "Target",
+        "Target_pct",
         "Risk_pct",
         "RewardRisk_to_Target",
         "RelVol20",
+        "DrawdownFromCrashHigh_pct",
+        "RecoveryFromRecentLow_pct",
         "ResistanceDistance_pct",
         "ResistanceBefore5pctTarget",
     ]
@@ -500,10 +566,13 @@ else:
             "Score": st.column_config.NumberColumn(format="%d"),
             "Entry": st.column_config.NumberColumn(format="$%.2f"),
             "Stop": st.column_config.NumberColumn(format="$%.2f"),
-            "Target_5pct": st.column_config.NumberColumn(format="$%.2f"),
+            "Target": st.column_config.NumberColumn(format="$%.2f"),
+            "Target_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "Risk_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "RewardRisk_to_Target": st.column_config.NumberColumn(format="%.2f"),
             "RelVol20": st.column_config.NumberColumn(format="%.2f×"),
+            "DrawdownFromCrashHigh_pct": st.column_config.NumberColumn(format="%.2f%%"),
+            "RecoveryFromRecentLow_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "ResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
@@ -516,18 +585,18 @@ else:
         use_container_width=True,
     )
 
-    with st.expander("How to read Fresh momentum", expanded=False):
+    with st.expander("How to read these results", expanded=False):
         st.markdown(
             f"""
-- **FRESH_BREAKOUT** = the latest completed hour moved through a defined base high; it is not a retest setup.
-- **EARLY_RECOVERY** = the latest completed hour reclaimed the 20 EMA or broke short structure after recent weakness.
-- **SignalPhase** tells you whether the setup is fresh on the current completed hourly bar or confirmed after more trend proof.
-- **Entry** is the prior completed candle close; it is not a market order instruction.
-- **Stop** is the proposed invalidation level. **Target** is Entry × **{target_pct:.1f}%**.
-- Fresh signals use tighter extension and volume rules, but they are naturally less confirmed and may fail more often than mature trend setups.
-- Check current price, the daily chart, earnings/news, and liquidity before acting.
+- **CRASH_RECOVERY** = the stock is still at least the profile drawdown threshold below its prior **recent hourly high**, but the latest completed hour has broken the prior few hours' structure on a bullish, volume-backed bar. It does **not** require an EMA20 or EMA50 reclaim.
+- **DrawdownFromCrashHigh_pct** uses the last 120 completed hourly bars (roughly several weeks of regular trading), not the stock's all-time high.
+- **RecoveryFromRecentLow_pct** shows how far the current entry has already bounced from the recent low. Lower generally means earlier, but also less confirmed.
+- **Target** is the usable target. For crash recoveries it is capped at the first meaningful overhead resistance; **Target_pct** may therefore be below the UI's theoretical {target_pct:.1f}% target.
+- **Entry** is the prior completed candle close, not a market-order instruction. **Stop** is a proposed invalidation level.
+- Deep-crash bounces can fail abruptly. Check company-specific news, earnings timing, liquidity, and broader-market conditions before acting.
 """
         )
+
 
 if st.session_state.last_show_debug:
     with st.expander("All classifications", expanded=False):
