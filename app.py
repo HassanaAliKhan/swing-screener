@@ -452,22 +452,49 @@ with st.expander("Watchlist and scan settings", expanded=False):
         include_prepost = st.checkbox("Include premarket / after-hours", value=True)
 
     controls_4, controls_5, controls_6 = st.columns(3)
-    with controls_4:
-        min_score = st.slider(
-            "Minimum setup score",
-            min_value=45,
-            max_value=90,
-            step=1,
-            key="min_score_control",
-        )
-    with controls_5:
-        min_rel_volume = st.slider(
-            "Minimum relative volume",
-            min_value=0.20,
-            max_value=1.50,
-            step=0.05,
-            key="min_rel_volume_control",
-        )
+    if profile == "Crash recovery":
+        # Crash recovery is a ranked watchlist. Its candidate function deliberately
+        # ignores the normal score / exact-bar relative-volume gates, so do not
+        # render those controls here. This also prevents a stale Streamlit session
+        # value (for example, score=40) from violating the ordinary slider's
+        # minimum of 45 after a deployment.
+        min_score = int(PROFILE_SETTINGS[profile]["min_score"])
+        min_rel_volume = float(PROFILE_SETTINGS[profile]["min_rel_volume"])
+        with controls_4:
+            st.caption("Setup-score filter")
+            st.info("Not used in Crash recovery")
+        with controls_5:
+            st.caption("Current-bar relative-volume filter")
+            st.info("Not used in Crash recovery")
+    else:
+        # Session state can survive a Streamlit Cloud deployment. Clamp stale
+        # crash-recovery values before constructing the ordinary profile sliders.
+        current_score = int(st.session_state.get("min_score_control", 45))
+        if current_score < 45 or current_score > 90:
+            st.session_state.min_score_control = int(PROFILE_SETTINGS[profile]["min_score"])
+
+        current_rel_volume = float(st.session_state.get("min_rel_volume_control", 0.20))
+        if current_rel_volume < 0.20 or current_rel_volume > 1.50:
+            st.session_state.min_rel_volume_control = float(
+                PROFILE_SETTINGS[profile]["min_rel_volume"]
+            )
+
+        with controls_4:
+            min_score = st.slider(
+                "Minimum setup score",
+                min_value=45,
+                max_value=90,
+                step=1,
+                key="min_score_control",
+            )
+        with controls_5:
+            min_rel_volume = st.slider(
+                "Minimum relative volume",
+                min_value=0.20,
+                max_value=1.50,
+                step=0.05,
+                key="min_rel_volume_control",
+            )
     with controls_6:
         workers = st.select_slider(
             "Yahoo request concurrency",
