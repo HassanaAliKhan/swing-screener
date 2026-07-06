@@ -22,12 +22,15 @@ CRASH_RECOVERY_DEFAULTS: dict[str, Any] = {
     "allow_crash_recovery": False,
     "crash_recovery_only": False,
     "crash_recovery_high_lookback_bars": 300,
-    "crash_recovery_min_drawdown_pct": 25.0,
-    "crash_recovery_recent_low_bars": 10,
+    "crash_recovery_low_lookback_bars": 120,
+    "crash_recovery_signal_lookback_bars": 12,
+    "crash_recovery_min_drawdown_pct": 20.0,
+    "crash_recovery_min_recovery_from_low_pct": 1.0,
     "crash_recovery_structure_bars": 3,
-    "crash_recovery_min_rel_volume": 0.90,
-    "crash_recovery_max_recovery_from_low_pct": 12.0,
-    "crash_recovery_min_practical_target_pct": 1.00,
+    "crash_recovery_min_positive_bars": 2,
+    "crash_recovery_min_rel_volume": 0.00,
+    "crash_recovery_max_recovery_from_low_pct": 45.0,
+    "crash_recovery_min_practical_target_pct": 0.00,
     "crash_recovery_target_buffer_pct": 0.20,
 }
 
@@ -35,10 +38,12 @@ CRASH_RECOVERY_DEFAULTS: dict[str, Any] = {
 PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
     "Crash recovery": {
         # Exact-only mode: legacy ATH/momentum patterns are deliberately disabled.
-        "min_score": 50,
-        "max_risk_pct": 6.5,
-        "min_reward_risk": 0.60,
-        "min_rel_volume": 0.70,
+        # This is a ranked recovery watchlist. It can return a fresh structure
+        # trigger or a still-building recovery whose trigger occurred recently.
+        "min_score": 40,
+        "max_risk_pct": 25.0,
+        "min_reward_risk": 0.00,
+        "min_rel_volume": 0.30,
         "min_hourly_dollar_volume": 150_000,
         "min_price": 3.00,
         "pullback_touch_pct": 2.0,
@@ -67,12 +72,15 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "allow_crash_recovery": True,
         "crash_recovery_only": True,
         "crash_recovery_high_lookback_bars": 300,
-        "crash_recovery_min_drawdown_pct": 25.0,
-        "crash_recovery_recent_low_bars": 10,
+        "crash_recovery_low_lookback_bars": 120,
+        "crash_recovery_signal_lookback_bars": 12,
+        "crash_recovery_min_drawdown_pct": 20.0,
+        "crash_recovery_min_recovery_from_low_pct": 1.0,
         "crash_recovery_structure_bars": 3,
-        "crash_recovery_min_rel_volume": 0.90,
-        "crash_recovery_max_recovery_from_low_pct": 12.0,
-        "crash_recovery_min_practical_target_pct": 1.00,
+        "crash_recovery_min_positive_bars": 2,
+        "crash_recovery_min_rel_volume": 0.00,
+        "crash_recovery_max_recovery_from_low_pct": 45.0,
+        "crash_recovery_min_practical_target_pct": 0.00,
         "crash_recovery_target_buffer_pct": 0.20,
     },
     "Fresh momentum": {
@@ -341,13 +349,15 @@ def scan_watchlist(
             )
 
     if getattr(args, "crash_recovery_only", False):
-        # In crash-recovery mode, prioritize the deepest remaining drawdown and
-        # the earliest bounce, not the largest generic momentum score.
+        # Show current entry triggers first, then building recoveries, then early
+        # watch names. Within each state, put the largest remaining drawdown first.
+        status_rank = {"TRIGGERED": 0, "BUILDING": 1, "WATCH": 2}
         candidates.sort(
             key=lambda row: (
+                status_rank.get(str(row.get("RecoveryStatus", "WATCH")), 3),
                 float(row.get("DrawdownFromCrashHigh_pct", 0.0)),
-                float(row.get("RecoveryFromRecentLow_pct", float("inf"))),
-                -float(row.get("RelVol20", 0.0)),
+                float(row.get("RecoveryFromCrashLow_pct", float("inf"))),
+                -float(row.get("RecentMaxRelVol20", 0.0)),
             )
         )
     else:
@@ -371,8 +381,8 @@ def dataframe_csv(df: pd.DataFrame) -> bytes:
 
 st.title("Hourly Swing Screener")
 st.caption(
-    "On-demand 60-minute scan. Crash recovery finds the first volume-backed "
-    "structure break after a major recent selloff; other profiles focus on momentum confirmation."
+    "On-demand 60-minute scan. Crash recovery ranks stocks still far below their "
+    "pre-crash high whose recovery is active or recently triggered; other profiles focus on momentum confirmation."
 )
 
 if "watchlist_text" not in st.session_state:
@@ -425,9 +435,9 @@ with st.expander("Watchlist and scan settings", expanded=False):
             key="profile_select",
             on_change=reset_profile_controls,
             help=(
-                "Crash recovery finds deeply sold-off names making their first short-structure break; "
-                "it does not require an EMA20 reclaim. Fresh momentum profiles focus on early breakouts; "
-                "confirmed profiles wait for more trend proof."
+                "Crash recovery is a ranked watchlist for deeply sold-off names that are bouncing or building a reversal. "
+                "It labels each result as WATCH, BUILDING, or TRIGGERED instead of requiring every name "
+                "to break out during the exact scan hour."
             ),
         )
     with controls_2:
@@ -470,32 +480,33 @@ with st.expander("Watchlist and scan settings", expanded=False):
         crash_1, crash_2, crash_3 = st.columns(3)
         with crash_1:
             crash_min_drawdown = st.slider(
-                "Minimum drawdown from recent high (%)",
+                "Minimum remaining drop from pre-crash high (%)",
                 min_value=15.0,
                 max_value=70.0,
                 value=float(PROFILE_SETTINGS["Crash recovery"]["crash_recovery_min_drawdown_pct"]),
                 step=1.0,
-                help="The stock must still be this far below the high of the selected completed-hour lookback window.",
+                help="The stock must still be this far below its highest hourly high before the crash low.",
             )
         with crash_2:
             crash_high_lookback = st.select_slider(
-                "Recent-high lookback (completed hourly bars)",
+                "Pre-crash high lookback (completed hourly bars)",
                 options=[120, 180, 240, 300, 360, 480],
                 value=int(PROFILE_SETTINGS["Crash recovery"]["crash_recovery_high_lookback_bars"]),
-                help="The table shows the highest pre-crash hourly high within this lookback. It is not a literal all-time-high measure.",
+                help="The table shows the highest hourly high before the selected crash low within this lookback. It is not literal all-time-high data.",
             )
         with crash_3:
             crash_max_recovery = st.slider(
-                "Maximum bounce already made from recent low (%)",
-                min_value=4.0,
-                max_value=25.0,
+                "Maximum bounce already made from crash low (%)",
+                min_value=10.0,
+                max_value=60.0,
                 value=float(PROFILE_SETTINGS["Crash recovery"]["crash_recovery_max_recovery_from_low_pct"]),
                 step=1.0,
-                help="Keeps the result early in its recovery rather than after a large bounce.",
+                help="Excludes mature rebounds while allowing damaged names whose recovery started more than a few hours ago.",
             )
         st.caption(
-            "Crash recovery is exact-only: it returns only deeply sold-off names that broke the latest hourly short structure on a bullish, volume-backed bar. "
-            "It does not allow legacy uptrend, breakout, or ATH-near patterns to compete. EMA20/EMA50 are not gates."
+            "Crash recovery is exact-only: it never emits normal uptrend, breakout, or near-high continuation rows. "
+            "It is a recovery watchlist, so it labels each name as WATCH, BUILDING, or TRIGGERED. "
+            "EMA20/EMA50 and volume help rank the rows but are not hard gates."
         )
     else:
         crash_min_drawdown = None
@@ -582,19 +593,21 @@ metric_1.metric("Potential long entries", len(good_entries))
 metric_2.metric("Classified tickers", len(classifications))
 metric_3.metric("Data errors / unavailable", len(errors))
 
-st.subheader("Good long-entry candidates")
+st.subheader("Crash-recovery candidates" if profile == "Crash recovery" else "Good long-entry candidates")
 
 if good_entries.empty:
     st.warning(
-        "No names passed the selected rules. This is normal; do not force trades. "
-        "Crash recovery now emits only CRASH_RECOVERY rows. It will not return general "
-        "breakouts, pullbacks, or near-high continuation patterns."
+        "No names currently met the selected recovery conditions. This does not mean the scan failed. "
+        "Use the classifications table to see the state of every ticker, and do not force a trade."
     )
 else:
     display_columns = [
         "Ticker",
         "Pattern",
         "SignalPhase",
+        "Action",
+        "RecoveryStatus",
+        "EntryReadiness",
         "Score",
         "LastCompletedHourlyBar",
         "Entry",
@@ -606,10 +619,16 @@ else:
         "RelVol20",
         "HighestBeforeCrash",
         "HighestBeforeCrashBar",
-        "RecentLow",
-        "RecentLowBar",
+        "CrashLow",
+        "CrashLowBar",
         "DrawdownFromCrashHigh_pct",
-        "RecoveryFromRecentLow_pct",
+        "RecoveryFromCrashLow_pct",
+        "RecoveryStage",
+        "RecoveryTriggerFreshnessBars",
+        "RecentPositiveBars",
+        "RecentMaxRelVol20",
+        "VolumeConfirmed",
+        "ShortTermSupport",
         "ResistanceDistance_pct",
         "ResistanceBefore5pctTarget",
     ]
@@ -629,9 +648,11 @@ else:
             "RewardRisk_to_Target": st.column_config.NumberColumn(format="%.2f"),
             "RelVol20": st.column_config.NumberColumn(format="%.2f×"),
             "HighestBeforeCrash": st.column_config.NumberColumn(format="$%.2f"),
-            "RecentLow": st.column_config.NumberColumn(format="$%.2f"),
+            "CrashLow": st.column_config.NumberColumn(format="$%.2f"),
+            "ShortTermSupport": st.column_config.NumberColumn(format="$%.2f"),
             "DrawdownFromCrashHigh_pct": st.column_config.NumberColumn(format="%.2f%%"),
-            "RecoveryFromRecentLow_pct": st.column_config.NumberColumn(format="%.2f%%"),
+            "RecoveryFromCrashLow_pct": st.column_config.NumberColumn(format="%.2f%%"),
+            "RecentMaxRelVol20": st.column_config.NumberColumn(format="%.2f×"),
             "ResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
@@ -647,17 +668,17 @@ else:
     with st.expander("How to read these results", expanded=False):
         st.markdown(
             f"""
-- **CRASH_RECOVERY** = the stock is still at least the selected drawdown threshold below its prior **recent hourly high**, and the latest completed hour broke the prior few hours' structure on a bullish, volume-backed bar. It does **not** require an EMA20 or EMA50 reclaim.
-- **HighestBeforeCrash** is the highest hourly high *before the selected recovery low* inside the configured completed-hour lookback. **HighestBeforeCrashBar** tells you when that high occurred, so you can verify it on the chart. This is a pre-crash reference, **not** a literal all-time high.
-- **RecentLow** and **RecentLowBar** show the trough used to measure the current bounce.
-- **DrawdownFromCrashHigh_pct** measures the remaining drop from that highest-before-crash reference.
-- **RecoveryFromRecentLow_pct** shows how far the current entry has already bounced from the recent low. Lower generally means earlier, but also less confirmed.
-- Results are sorted by **largest remaining drawdown first**, then smallest bounce from the recent low. General breakout/uptrend rows are excluded in this profile.
-- **Target** is the usable target. For crash recoveries it is capped at the first meaningful overhead resistance; **Target_pct** may therefore be below the UI's theoretical {target_pct:.1f}% target.
-- **Entry** is the prior completed candle close, not a market-order instruction. **Stop** is a proposed invalidation level.
-- Deep-crash bounces can fail abruptly. Check company-specific news, earnings timing, liquidity, and broader-market conditions before acting.
+- **CRASH_RECOVERY** is a ranked watchlist for stocks that remain materially below their pre-crash high. It never emits normal near-high breakout or uptrend candidates.
+- **RecoveryStatus = TRIGGERED** means the latest completed hourly bar broke local short-term structure. **BUILDING** means the rebound is constructive or a trigger happened recently. **WATCH** means the name has started a rebound but has not yet shown enough short-term confirmation; it is not an entry instruction.
+- **HighestBeforeCrash** is the highest hourly high *before* the selected crash low inside the selected lookback. It is a pre-crash reference, **not** literal all-time-high data.
+- **CrashLow** is the lowest hourly low found in the recovery-reference window. **RecoveryFromCrashLow_pct** shows how much of the initial rebound has already occurred.
+- **DrawdownFromCrashHigh_pct** is the remaining percentage below the pre-crash high. More negative means the stock is still further below that reference.
+- **ShortTermSupport** and **Stop** are trade-management references. The stop is based on recent recovery support, not the original crash low.
+- **Target** is capped at the first meaningful overhead resistance. It can be materially below the UI's theoretical {target_pct:.1f}% target.
+- Check current price, news, earnings, and liquidity before acting. Deep recoveries can fail sharply or resume the downtrend.
 """
         )
+
 
 
 if st.session_state.last_show_debug:
