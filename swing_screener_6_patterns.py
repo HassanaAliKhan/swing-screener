@@ -1014,20 +1014,27 @@ def try_high_conviction_crash_recovery(
     ticker: str,
     args: argparse.Namespace,
 ) -> dict[str, Any] | None:
-    """Return a small, entry-ready subset of deep recoveries.
+    """Return a compact, ranked recovery shortlist instead of a brittle exact trigger.
 
-    This is intentionally different from the broad crash-recovery watchlist.
-    It rejects names that are merely off the lows. A candidate must have a recent
-    volume-backed local breakout, hold above a rising EMA20, offer enough room to
-    a meaningful target, and keep the structural stop contained.
+    This profile is designed to find deeply sold-off names that are recovering
+    constructively *before* they become mature momentum names.  It intentionally
+    uses a few structural safety gates, then ranks the survivors.  Earlier
+    versions required every quality feature to be perfect at the same time
+    (fresh 2-hour breakout, rising EMA20, high current volume, 3% target after
+    resistance, 1.40 reward/risk), which made valid recovery candidates vanish.
+
+    A returned row is a research candidate, not a guarantee or an automatic
+    order.  The Action column tells whether the recovery already has a recent
+    breakout or still needs an hourly confirmation.
     """
     if not getattr(args, "allow_crash_recovery", False):
         return None
 
     high_lookback = max(80, int(getattr(args, "crash_recovery_high_lookback_bars", 300)))
     low_lookback = max(30, int(getattr(args, "crash_recovery_low_lookback_bars", 120)))
-    max_signal_age = max(0, int(getattr(args, "crash_recovery_max_signal_age_bars", 2)))
+    signal_lookback = max(8, int(getattr(args, "crash_recovery_signal_lookback_bars", 12)))
     structure_bars = max(3, int(getattr(args, "crash_recovery_structure_bars", 3)))
+    max_signal_age = max(3, int(getattr(args, "crash_recovery_max_signal_age_bars", 10)))
 
     high_window = df.iloc[-(high_lookback + 1):-1]
     low_window = df.iloc[-(low_lookback + 1):-1]
@@ -1048,7 +1055,7 @@ def try_high_conviction_crash_recovery(
     recovery_from_low = pct(entry, crash_low)
 
     min_drawdown = abs(float(getattr(args, "crash_recovery_min_drawdown_pct", 20.0)))
-    min_recovery = max(3.0, float(getattr(args, "crash_recovery_min_recovery_from_low_pct", 3.0)))
+    min_recovery = max(2.0, float(getattr(args, "crash_recovery_min_recovery_from_low_pct", 3.0)))
     max_recovery = float(getattr(args, "crash_recovery_max_recovery_from_low_pct", 35.0))
     if not (
         drawdown_from_high <= -min_drawdown
@@ -1056,17 +1063,31 @@ def try_high_conviction_crash_recovery(
     ):
         return None
 
-    # The trade is not accepted while still below a falling EMA20. This gives up
-    # the earliest possible bounce in exchange for a more defensible invalidation.
-    if not (
-        entry >= float(bar["EMA20"])
-        and float(bar["EMA20Slope5"]) >= 0.0
-        and float(bar["EMA8Slope3"]) >= 0.0
-    ):
+    # Keep the shortlist tradeable. This is intentionally higher than the broad
+    # discovery profile's minimum but lower than the old $5M hard gate when the
+    # user's watchlist contains smaller, actively traded recovery names.
+    min_dollar_volume = float(getattr(args, "min_hourly_dollar_volume", 3_000_000))
+    if float(bar["AvgDollarVol20"]) < min_dollar_volume:
         return None
 
+    signal_window = df.iloc[-signal_lookback:]
+    positive_bars = int((signal_window["Close"] > signal_window["Open"]).sum())
+    recent_max_relvol = float(signal_window["RelVol20"].max())
+    current_relvol = float(bar["RelVol20"])
+    ema20_slope = float(bar["EMA20Slope5"])
+    ema8_slope = float(bar["EMA8Slope3"])
     distance_to_ema20 = pct(entry, float(bar["EMA20"]))
-    if not (0.0 <= distance_to_ema20 <= 4.5):
+
+    # The price may be a little below EMA20 in a genuine early recovery. The
+    # old requirement to be above a *rising* EMA20 rejected most of the good
+    # early candidates before the indicator had time to turn.
+    if distance_to_ema20 < -3.0 or distance_to_ema20 > 5.0:
+        return None
+    if positive_bars < max(3, int(getattr(args, "crash_recovery_min_positive_bars", 3))):
+        return None
+    if recent_max_relvol < float(getattr(args, "crash_recovery_min_recent_rel_volume", 0.80)):
+        return None
+    if ema8_slope < 0.0 and ema20_slope < -0.35 * float(bar["ATR14"]):
         return None
 
     trigger_positions = _recent_structure_triggers(
@@ -1074,129 +1095,138 @@ def try_high_conviction_crash_recovery(
         structure_bars=structure_bars,
         signal_lookback=max_signal_age + 1,
     )
-    if not trigger_positions:
-        return None
-
-    min_current_relvol = float(
-        getattr(args, "crash_recovery_min_current_rel_volume", 0.80)
+    latest_trigger_pos = trigger_positions[-1] if trigger_positions else None
+    signal_age = (
+        len(df) - 1 - latest_trigger_pos
+        if latest_trigger_pos is not None
+        else math.nan
     )
-    eligible_triggers: list[int] = []
-    for pos in trigger_positions:
-        age = len(df) - 1 - pos
-        if age > max_signal_age:
-            continue
-        trigger_bar = df.iloc[pos]
-        if float(trigger_bar["RelVol20"]) >= min_current_relvol:
-            eligible_triggers.append(pos)
-    if not eligible_triggers:
+    trigger_bar = df.iloc[latest_trigger_pos] if latest_trigger_pos is not None else None
+    trigger_relvol = float(trigger_bar["RelVol20"]) if trigger_bar is not None else math.nan
+
+    # A recent breakout is a quality advantage, not a mandatory one. For names
+    # without one, require that the recovery is at least holding near EMA20;
+    # these are surfaced as confirmation candidates rather than immediate buys.
+    has_recent_trigger = bool(np.isfinite(signal_age) and signal_age <= max_signal_age)
+    if not has_recent_trigger and distance_to_ema20 < -1.5:
         return None
 
-    trigger_pos = eligible_triggers[-1]
-    trigger_bar = df.iloc[trigger_pos]
-    signal_age = len(df) - 1 - trigger_pos
-    extension_from_trigger_high = pct(entry, float(trigger_bar["High"]))
-    max_extension = float(getattr(args, "crash_recovery_max_extension_pct", 2.5))
-    if entry < float(trigger_bar["Close"]) * 0.985 or extension_from_trigger_high > max_extension:
-        return None
+    if trigger_bar is not None:
+        extension_from_trigger_high = pct(entry, float(trigger_bar["High"]))
+        max_extension = float(getattr(args, "crash_recovery_max_extension_pct", 4.0))
+        if entry < float(trigger_bar["Close"]) * 0.97 or extension_from_trigger_high > max_extension:
+            return None
+    else:
+        extension_from_trigger_high = math.nan
 
-    signal_window = df.iloc[-max(6, max_signal_age + 4):]
-    positive_bars = int((signal_window["Close"] > signal_window["Open"]).sum())
-    recent_max_relvol = float(signal_window["RelVol20"].max())
-    if positive_bars < 3:
-        return None
-    if recent_max_relvol < float(getattr(args, "crash_recovery_min_recent_rel_volume", 1.10)):
-        return None
-
-    # A close below the trigger bar is treated as failed momentum, not a dip-buy.
-    # The current bar may have cooled volume after a prior trigger; the trigger
-    # itself and the short recovery window must still show material participation.
+    # A support-based stop makes the downside test visible. It is deliberately
+    # not placed at the original crash low, which would make nearly every setup
+    # look untradeable.
     short_support_window = df.iloc[-max(6, structure_bars + 3):-1]
     if short_support_window.empty:
         return None
     short_support = float(short_support_window["Low"].min())
-    stop = min(
-        short_support - 0.10 * float(bar["ATR14"]),
-        float(bar["EMA20"]) - 0.35 * float(bar["ATR14"]),
-    )
+    stop = short_support - 0.10 * float(bar["ATR14"])
     risk_pct = (entry - stop) / entry * 100.0
-    max_risk = float(getattr(args, "crash_recovery_max_risk_pct", 4.0))
-    if not np.isfinite(risk_pct) or risk_pct <= 0 or risk_pct > max_risk:
-        return None
-
-    target_pct = float(args.target_pct)
-    min_target_pct = float(getattr(args, "crash_recovery_min_target_pct", 3.0))
-    resistance = meaningful_overhead_pivot_resistance(
-        df,
-        entry,
-        lookback=min(high_lookback, 120),
-        min_distance_pct=min_target_pct,
-        pivot_radius=2,
-    )
-    theoretical_target = entry * (1.0 + target_pct / 100.0)
-    practical_target = theoretical_target
-    if np.isfinite(resistance):
-        practical_target = min(
-            theoretical_target,
-            resistance * (1.0 - float(getattr(args, "crash_recovery_target_buffer_pct", 0.20)) / 100.0),
-        )
-
-    actual_target_pct = pct(practical_target, entry)
-    reward_risk = actual_target_pct / risk_pct if risk_pct > 0 else math.nan
-    if (
-        not np.isfinite(actual_target_pct)
-        or actual_target_pct < min_target_pct
-        or not np.isfinite(reward_risk)
-        or reward_risk < float(getattr(args, "crash_recovery_min_reward_risk", 1.25))
-    ):
+    max_risk = float(getattr(args, "crash_recovery_max_risk_pct", 6.0))
+    if not np.isfinite(risk_pct) or risk_pct <= 0.0 or risk_pct > max_risk:
         return None
 
     crash_midpoint = crash_low + (crash_high - crash_low) * 0.50
     upside_to_midpoint = pct(crash_midpoint, entry)
     min_upside_to_midpoint = float(
-        getattr(args, "crash_recovery_min_upside_to_midpoint_pct", 12.0)
+        getattr(args, "crash_recovery_min_upside_to_midpoint_pct", 8.0)
     )
     if not np.isfinite(upside_to_midpoint) or upside_to_midpoint < min_upside_to_midpoint:
         return None
 
-    score = 60
-    score += 12 if signal_age == 0 else 7 if signal_age == 1 else 4
-    score += 10 if float(trigger_bar["RelVol20"]) >= 1.25 else 0
-    score += 7 if recent_max_relvol >= 1.50 else 0
-    score += 10 if risk_pct <= 2.50 else 5 if risk_pct <= 3.50 else 0
-    score += 9 if actual_target_pct >= 4.00 else 4 if actual_target_pct >= 3.00 else 0
-    score += 7 if reward_risk >= 1.75 else 3 if reward_risk >= 1.40 else 0
-    score += 5 if entry > float(bar["EMA50"]) else 0
-    score += 5 if drawdown_from_high <= -35.0 else 0
-    score += 4 if recovery_from_low <= 25.0 else 0
-    score += 4 if upside_to_midpoint >= 20.0 else 0
+    # Use structural pivot resistance, not the nearest hourly wick. The old
+    # code treated a 0.2% intrabar wick as resistance and reduced almost every
+    # target to near zero. A pivot at least 2% above entry is more meaningful.
+    desired_target_pct = min(max(3.0, float(args.target_pct)), 5.0)
+    resistance = meaningful_overhead_pivot_resistance(
+        df,
+        entry,
+        lookback=min(high_lookback, 120),
+        min_distance_pct=2.0,
+        pivot_radius=2,
+    )
+    theoretical_target = entry * (1.0 + desired_target_pct / 100.0)
+    practical_target = theoretical_target
+    if np.isfinite(resistance):
+        capped_resistance = resistance * (
+            1.0 - float(getattr(args, "crash_recovery_target_buffer_pct", 0.10)) / 100.0
+        )
+        if capped_resistance > entry:
+            practical_target = min(theoretical_target, capped_resistance)
 
-    # The broad recovery profile is a discovery watchlist. This profile is
-    # entry-only, so it also requires a minimum composite-quality score.
-    min_quality_score = int(getattr(args, "min_score", 70))
+    actual_target_pct = pct(practical_target, entry)
+    reward_risk = actual_target_pct / risk_pct if risk_pct > 0 else math.nan
+    min_target_pct = float(getattr(args, "crash_recovery_min_target_pct", 2.0))
+    min_reward_risk = float(getattr(args, "crash_recovery_min_reward_risk", 0.80))
+    if (
+        not np.isfinite(actual_target_pct)
+        or actual_target_pct < min_target_pct
+        or not np.isfinite(reward_risk)
+        or reward_risk < min_reward_risk
+    ):
+        return None
+
+    # Rank rather than over-filter. The score favors room to run, volume and
+    # fresh structure; it penalizes wider stops and overly extended rebounds.
+    score = 45
+    score += 9 if has_recent_trigger and signal_age <= 1 else 6 if has_recent_trigger and signal_age <= 3 else 3 if has_recent_trigger else 0
+    score += 8 if trigger_bar is not None and trigger_relvol >= 1.15 else 4 if trigger_bar is not None and trigger_relvol >= 0.70 else 0
+    score += 8 if recent_max_relvol >= 1.50 else 5 if recent_max_relvol >= 1.00 else 2
+    score += 7 if distance_to_ema20 >= 0.0 else 3
+    score += 6 if ema20_slope >= 0.0 else 3 if ema8_slope >= 0.0 else 0
+    score += 6 if positive_bars >= 5 else 3
+    score += 11 if risk_pct <= 2.5 else 7 if risk_pct <= 4.0 else 3
+    score += 7 if reward_risk >= 1.50 else 4 if reward_risk >= 1.00 else 1
+    score += 6 if actual_target_pct >= 4.0 else 3
+    score += 5 if drawdown_from_high <= -35.0 else 2
+    score += 4 if recovery_from_low <= 20.0 else 1
+    score += 5 if upside_to_midpoint >= 20.0 else 2
+    score += 3 if np.isfinite(resistance) and pct(resistance, entry) >= 3.0 else 0
+    score += 2 if current_relvol >= 0.60 else 0
+
+    min_quality_score = int(getattr(args, "min_score", 62))
     if score < min_quality_score:
         return None
 
+    if has_recent_trigger and signal_age <= 3:
+        action = "ENTRY_REVIEW"
+        readiness = "Recent local breakout is holding; verify current price and news before entry."
+        phase = "Ranked recovery — breakout held"
+    else:
+        action = "CONFIRM_ON_BREAK"
+        readiness = "Recovery is constructive but needs a fresh hourly break above short-term structure."
+        phase = "Ranked recovery — confirmation pending"
+
+    quality_tier = "A" if score >= 86 and action == "ENTRY_REVIEW" else "B" if score >= 76 else "C"
+
     return make_candidate(
         ticker=ticker,
-        pattern="HIGH_CONVICTION_CRASH_RECOVERY",
+        pattern="RANKED_CRASH_RECOVERY",
         score=score,
         bar=bar,
         entry=entry,
         stop=float(stop),
-        target_pct=target_pct,
+        target_pct=desired_target_pct,
         support=short_support,
         resistance=resistance,
         reason=(
-            "Deep recovery with a recent volume-backed local breakout, price holding "
-            "above a rising EMA20, controlled structural risk, and room to a meaningful target."
+            "Deeply sold-off recovery ranked for liquidity, constructive price action, "
+            "volume participation, controlled support-based risk, and remaining room to the crash midpoint."
         ),
-        signal_phase="High-conviction recovery entry",
-        signal_age_bars=int(signal_age),
+        signal_phase=phase,
+        signal_age_bars=(int(signal_age) if np.isfinite(signal_age) else math.nan),
         practical_target=float(practical_target),
         extra_fields={
-            "Action": "ENTRY_REVIEW",
-            "RecoveryStatus": "HIGH_CONVICTION",
-            "EntryReadiness": "Recent volume-backed local breakout held above a rising EMA20.",
+            "Action": action,
+            "RecoveryStatus": "RANKED_SHORTLIST",
+            "RecoveryQualityTier": quality_tier,
+            "EntryReadiness": readiness,
             "HighestBeforeCrash": num(crash_high),
             "HighestBeforeCrashBar": str(highest_before_crash_bar),
             "HighReferenceLookbackBars": int(high_lookback),
@@ -1205,19 +1235,24 @@ def try_high_conviction_crash_recovery(
             "CrashLowLookbackBars": int(low_lookback),
             "DrawdownFromCrashHigh_pct": num(drawdown_from_high),
             "RecoveryFromCrashLow_pct": num(recovery_from_low),
-            "RecoveryStage": "HIGH_CONVICTION",
-            "RecoveryTriggerFreshnessBars": int(signal_age),
+            "RecoveryStage": "RANKED_SHORTLIST",
+            "RecoveryTriggerFreshnessBars": int(signal_age) if np.isfinite(signal_age) else math.nan,
             "RecentPositiveBars": positive_bars,
             "RecentMaxRelVol20": num(recent_max_relvol),
-            "VolumeConfirmed": True,
+            "TriggerRelVol20": num(trigger_relvol),
+            "CurrentRelVol20": num(current_relvol),
+            "VolumeConfirmed": bool(recent_max_relvol >= 0.80),
             "ShortTermSupport": num(short_support),
             "ShortStructureHigh": num(float(df.iloc[-(structure_bars + 1):-1]["High"].max())),
             "MeaningfulResistance": num(resistance),
             "MeaningfulResistanceDistance_pct": num(pct(resistance, entry)),
             "UpsideToCrashMidpoint_pct": num(upside_to_midpoint),
-            "TriggerRelVol20": num(float(trigger_bar["RelVol20"])),
+            "EMA20Slope5": num(ema20_slope),
+            "EMA8Slope3": num(ema8_slope),
+            "DistanceToEMA20_pct": num(distance_to_ema20),
+            "ExtensionFromTriggerHigh_pct": num(extension_from_trigger_high),
             "QualityScore": int(score),
-            "EMA20Required": True,
+            "EMA20Required": False,
             "CrashRecoveryOnly": bool(getattr(args, "crash_recovery_only", False)),
             "HighConvictionRecovery": True,
         },
