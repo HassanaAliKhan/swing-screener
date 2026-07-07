@@ -33,27 +33,27 @@ CRASH_RECOVERY_DEFAULTS: dict[str, Any] = {
     "crash_recovery_min_practical_target_pct": 0.00,
     "crash_recovery_target_buffer_pct": 0.20,
     "crash_recovery_high_conviction": False,
-    "crash_recovery_max_results": 12,
-    "crash_recovery_max_signal_age_bars": 2,
-    "crash_recovery_min_current_rel_volume": 0.80,
-    "crash_recovery_min_recent_rel_volume": 1.10,
-    "crash_recovery_max_risk_pct": 4.00,
-    "crash_recovery_min_target_pct": 3.00,
-    "crash_recovery_min_upside_to_midpoint_pct": 12.00,
-    "crash_recovery_min_reward_risk": 1.25,
-    "crash_recovery_max_extension_pct": 2.50,
+    "crash_recovery_max_results": 8,
+    "crash_recovery_max_signal_age_bars": 10,
+    "crash_recovery_min_current_rel_volume": 0.55,
+    "crash_recovery_min_recent_rel_volume": 0.80,
+    "crash_recovery_max_risk_pct": 6.00,
+    "crash_recovery_min_target_pct": 2.00,
+    "crash_recovery_min_upside_to_midpoint_pct": 8.00,
+    "crash_recovery_min_reward_risk": 0.80,
+    "crash_recovery_max_extension_pct": 4.00,
 }
 
 
 PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
     "High-conviction recovery": {
-        # Entry-only mode: limited list of recoveries with a recent volume-backed
-        # breakout, rising EMA20, contained stop, and at least 3% target room.
-        "min_score": 75,
-        "max_risk_pct": 3.5,
-        "min_reward_risk": 1.40,
-        "min_rel_volume": 0.80,
-        "min_hourly_dollar_volume": 5_000_000,
+        # Ranked shortlist: a limited list of deep recoveries. Recent breakout,
+        # volume, trend and risk are ranked rather than all being hard gates.
+        "min_score": 62,
+        "max_risk_pct": 6.0,
+        "min_reward_risk": 0.80,
+        "min_rel_volume": 0.00,
+        "min_hourly_dollar_volume": 3_000_000,
         "min_price": 3.00,
         "pullback_touch_pct": 2.0,
         "pullback_max_ema20_distance_pct": 2.0,
@@ -85,22 +85,22 @@ PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "crash_recovery_low_lookback_bars": 120,
         "crash_recovery_signal_lookback_bars": 12,
         "crash_recovery_min_drawdown_pct": 20.0,
-        "crash_recovery_min_recovery_from_low_pct": 4.0,
+        "crash_recovery_min_recovery_from_low_pct": 3.0,
         "crash_recovery_structure_bars": 3,
         "crash_recovery_min_positive_bars": 3,
-        "crash_recovery_min_rel_volume": 0.80,
+        "crash_recovery_min_rel_volume": 0.00,
         "crash_recovery_max_recovery_from_low_pct": 35.0,
-        "crash_recovery_min_practical_target_pct": 3.0,
+        "crash_recovery_min_practical_target_pct": 2.0,
         "crash_recovery_target_buffer_pct": 0.20,
-        "crash_recovery_max_results": 5,
-        "crash_recovery_max_signal_age_bars": 2,
-        "crash_recovery_min_current_rel_volume": 0.90,
-        "crash_recovery_min_recent_rel_volume": 1.15,
-        "crash_recovery_max_risk_pct": 3.5,
-        "crash_recovery_min_target_pct": 3.0,
-        "crash_recovery_min_upside_to_midpoint_pct": 12.0,
-        "crash_recovery_min_reward_risk": 1.40,
-        "crash_recovery_max_extension_pct": 2.00,
+        "crash_recovery_max_results": 8,
+        "crash_recovery_max_signal_age_bars": 10,
+        "crash_recovery_min_current_rel_volume": 0.55,
+        "crash_recovery_min_recent_rel_volume": 0.80,
+        "crash_recovery_max_risk_pct": 6.0,
+        "crash_recovery_min_target_pct": 2.0,
+        "crash_recovery_min_upside_to_midpoint_pct": 8.0,
+        "crash_recovery_min_reward_risk": 0.80,
+        "crash_recovery_max_extension_pct": 4.00,
     },
     "Crash recovery": {
         # Exact-only mode: legacy ATH/momentum patterns are deliberately disabled.
@@ -521,8 +521,8 @@ with st.expander("Watchlist and scan settings", expanded=False):
             key="profile_select",
             on_change=reset_profile_controls,
             help=(
-                "High-conviction recovery is the trimmed entry-only mode. It returns only a small, ranked list of deeply sold-off "
-                "stocks with a recent volume-backed recovery breakout, controlled stop distance, and meaningful target room. "
+                "High-conviction recovery is the compact ranked shortlist. It keeps deeply sold-off names with constructive recovery behavior, "
+                "liquidity, controlled support-based risk, and room to the crash midpoint. A recent breakout improves the rank but is not a brittle all-or-nothing gate. "
                 "Crash recovery remains the wider discovery watchlist."
             ),
         )
@@ -547,7 +547,7 @@ with st.expander("Watchlist and scan settings", expanded=False):
         with controls_4:
             st.caption("Setup-score filter")
             if profile == "High-conviction recovery":
-                st.info(f"Fixed at {min_score} for entry-quality filtering")
+                st.info(f"Fixed at {min_score} for shortlist ranking")
             else:
                 st.info("Not used in Crash recovery")
         with controls_5:
@@ -630,12 +630,12 @@ with st.expander("Watchlist and scan settings", expanded=False):
         crash_max_recovery = None
         high_conviction_max_candidates = st.select_slider(
             "Maximum candidates to show",
-            options=[3, 5, 8],
-            value=5,
+            options=[5, 8, 10],
+            value=8,
             help="The scanner returns only the best-ranked qualified entries. It does not fill the list with weaker names when fewer qualify.",
         )
         st.caption(
-            "Entry-only rules: still at least 20% below the pre-crash high; at least 12% runway to the crash midpoint; 4%–35% off the crash low; a volume-backed local breakout within the last 2 completed hours; price holding above a rising EMA20; average hourly dollar volume at least $5M; stop risk no more than 3.5%; at least 3% practical target and 1.40 reward/risk."
+            "Ranked-shortlist rules: still at least 20% below the pre-crash high; 3%–35% off the crash low; at least 8% runway to the crash midpoint; average hourly dollar volume at least $3M; price no more than 3% below EMA20; constructive recent candles and volume; support-based risk no more than 6%. A recent breakout improves rank but is not an all-or-nothing requirement."
         )
     else:
         crash_min_drawdown = None
@@ -652,7 +652,7 @@ with st.expander("Watchlist and scan settings", expanded=False):
         )
     elif profile == "High-conviction recovery":
         st.caption(
-            "This profile intentionally sacrifices the earliest bounce to reduce false starts. Remaining upside to the pre-crash midpoint is shown as potential, while Target is the nearer trade-management objective."
+            "This profile returns a short ranked list rather than requiring a perfect current-hour breakout. Rows marked ENTRY_REVIEW already have a recent breakout; CONFIRM_ON_BREAK rows are constructive recoveries that still need an hourly confirmation."
         )
     elif profile.startswith("Fresh momentum"):
         st.caption(
@@ -747,6 +747,7 @@ else:
         "SignalPhase",
         "Action",
         "RecoveryStatus",
+        "RecoveryQualityTier",
         "EntryReadiness",
         "QualityScore",
         "Score",
@@ -770,6 +771,9 @@ else:
         "RecentMaxRelVol20",
         "TriggerRelVol20",
         "UpsideToCrashMidpoint_pct",
+        "MeaningfulResistance",
+        "MeaningfulResistanceDistance_pct",
+        "DistanceToEMA20_pct",
         "VolumeConfirmed",
         "ShortTermSupport",
         "ResistanceDistance_pct",
@@ -799,6 +803,9 @@ else:
             "RecentMaxRelVol20": st.column_config.NumberColumn(format="%.2f×"),
             "TriggerRelVol20": st.column_config.NumberColumn(format="%.2f×"),
             "UpsideToCrashMidpoint_pct": st.column_config.NumberColumn(format="%.2f%%"),
+            "MeaningfulResistance": st.column_config.NumberColumn(format="$%.2f"),
+            "MeaningfulResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
+            "DistanceToEMA20_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "ResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
@@ -814,13 +821,13 @@ else:
     with st.expander("How to read these results", expanded=False):
         st.markdown(
             f"""
-- **HIGH_CONVICTION_CRASH_RECOVERY** is the entry-only profile. It returns at most the selected number of names and does not pad the table with weaker rows. Every returned row has a recent volume-backed local breakout, price holding above a rising EMA20, a contained structural stop, and usable target room.
+- **RANKED_CRASH_RECOVERY** is the compact recovery shortlist. It returns at most the selected number of highest-ranked names. It does not promise a trade or a profit: **ENTRY_REVIEW** means a recent local breakout is holding; **CONFIRM_ON_BREAK** means the recovery is constructive but still needs a fresh hourly confirmation.
 - **CRASH_RECOVERY** remains the wide recovery watchlist. Its **TRIGGERED**, **BUILDING**, and **WATCH** labels are for discovery, not automatic entry.
 - **HighestBeforeCrash** is the highest hourly high *before* the selected crash low inside the selected lookback. It is a pre-crash reference, **not** literal all-time-high data.
 - **CrashLow** is the lowest hourly low found in the recovery-reference window. **RecoveryFromCrashLow_pct** shows how much of the initial rebound has already occurred.
 - **DrawdownFromCrashHigh_pct** is the remaining percentage below the pre-crash high. More negative means the stock is still further below that reference.
 - **ShortTermSupport** and **Stop** are trade-management references. The stop is based on recent recovery support, not the original crash low.
-- **Target** is capped at the first meaningful overhead resistance. It can be materially below the UI's theoretical {target_pct:.1f}% target.
+- **Target** uses a 3%–5% trade-management objective, capped only by a meaningful structural pivot rather than a tiny hourly wick. **MeaningfulResistance** remains a review field, not a claim that price will reach Target.
 - Check current price, news, earnings, and liquidity before acting. Deep recoveries can fail sharply or resume the downtrend.
 """
         )
