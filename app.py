@@ -32,10 +32,76 @@ CRASH_RECOVERY_DEFAULTS: dict[str, Any] = {
     "crash_recovery_max_recovery_from_low_pct": 45.0,
     "crash_recovery_min_practical_target_pct": 0.00,
     "crash_recovery_target_buffer_pct": 0.20,
+    "crash_recovery_high_conviction": False,
+    "crash_recovery_max_results": 12,
+    "crash_recovery_max_signal_age_bars": 2,
+    "crash_recovery_min_current_rel_volume": 0.80,
+    "crash_recovery_min_recent_rel_volume": 1.10,
+    "crash_recovery_max_risk_pct": 4.00,
+    "crash_recovery_min_target_pct": 3.00,
+    "crash_recovery_min_upside_to_midpoint_pct": 12.00,
+    "crash_recovery_min_reward_risk": 1.25,
+    "crash_recovery_max_extension_pct": 2.50,
 }
 
 
 PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
+    "High-conviction recovery": {
+        # Entry-only mode: limited list of recoveries with a recent volume-backed
+        # breakout, rising EMA20, contained stop, and at least 3% target room.
+        "min_score": 75,
+        "max_risk_pct": 3.5,
+        "min_reward_risk": 1.40,
+        "min_rel_volume": 0.80,
+        "min_hourly_dollar_volume": 5_000_000,
+        "min_price": 3.00,
+        "pullback_touch_pct": 2.0,
+        "pullback_max_ema20_distance_pct": 2.0,
+        "pullback_volume_multiplier": 1.20,
+        "breakout_event_volume_multiplier": 1.10,
+        "breakout_retest_tolerance_pct": 2.0,
+        "breakout_max_extension_pct": 2.0,
+        "range_support_distance_pct": 2.0,
+        "reversal_higher_low_pct": 0.25,
+        "reversal_structure_break_pct": 0.10,
+        "reversal_min_rel_volume": 0.90,
+        "allow_resistance_before_target": True,
+        "allow_neutral_candle": False,
+        "allow_reversal_below_ema50": True,
+        "allow_uptrend_continuation": False,
+        "allow_fresh_breakout": False,
+        "fresh_breakout_lookback_bars": 20,
+        "fresh_breakout_min_rel_volume": 1.00,
+        "fresh_breakout_max_extension_pct": 1.50,
+        "allow_early_recovery": False,
+        "early_recovery_lookback_bars": 6,
+        "early_recovery_min_rel_volume": 0.90,
+        "early_recovery_max_ema20_distance_pct": 1.75,
+        "early_recovery_structure_break_pct": 0.10,
+        "allow_crash_recovery": True,
+        "crash_recovery_only": True,
+        "crash_recovery_high_conviction": True,
+        "crash_recovery_high_lookback_bars": 300,
+        "crash_recovery_low_lookback_bars": 120,
+        "crash_recovery_signal_lookback_bars": 12,
+        "crash_recovery_min_drawdown_pct": 20.0,
+        "crash_recovery_min_recovery_from_low_pct": 4.0,
+        "crash_recovery_structure_bars": 3,
+        "crash_recovery_min_positive_bars": 3,
+        "crash_recovery_min_rel_volume": 0.80,
+        "crash_recovery_max_recovery_from_low_pct": 35.0,
+        "crash_recovery_min_practical_target_pct": 3.0,
+        "crash_recovery_target_buffer_pct": 0.20,
+        "crash_recovery_max_results": 5,
+        "crash_recovery_max_signal_age_bars": 2,
+        "crash_recovery_min_current_rel_volume": 0.90,
+        "crash_recovery_min_recent_rel_volume": 1.15,
+        "crash_recovery_max_risk_pct": 3.5,
+        "crash_recovery_min_target_pct": 3.0,
+        "crash_recovery_min_upside_to_midpoint_pct": 12.0,
+        "crash_recovery_min_reward_risk": 1.40,
+        "crash_recovery_max_extension_pct": 2.00,
+    },
     "Crash recovery": {
         # Exact-only mode: legacy ATH/momentum patterns are deliberately disabled.
         # This is a ranked recovery watchlist. It can return a fresh structure
@@ -348,9 +414,28 @@ def scan_watchlist(
                 }
             )
 
-    if getattr(args, "crash_recovery_only", False):
-        # Show current entry triggers first, then building recoveries, then early
-        # watch names. Within each state, put the largest remaining drawdown first.
+    if getattr(args, "crash_recovery_high_conviction", False):
+        # Entry-only list: rank the candidates that already passed every hard
+        # filter. Prioritize setup quality, reward/risk, target room, low risk,
+        # volume confirmation, and remaining recovery runway.
+        candidates.sort(
+            key=lambda row: (
+                float(row.get("QualityScore", row.get("Score", 0))),
+                float(row.get("RewardRisk_to_Target", 0.0)),
+                float(row.get("Target_pct", 0.0)),
+                -float(row.get("Risk_pct", float("inf"))),
+                float(row.get("RecentMaxRelVol20", row.get("RelVol20", 0.0))),
+                float(row.get("UpsideToCrashMidpoint_pct", 0.0)),
+            ),
+            reverse=True,
+        )
+        # This is a cap, not a fill target. Fewer than the requested number is
+        # the correct outcome when only a few names meet the strict rules.
+        max_results = max(1, int(getattr(args, "crash_recovery_max_results", 5)))
+        candidates = candidates[:max_results]
+    elif getattr(args, "crash_recovery_only", False):
+        # Broad discovery list: show triggers, then building recoveries, then
+        # watch names. It intentionally remains separate from entry quality.
         status_rank = {"TRIGGERED": 0, "BUILDING": 1, "WATCH": 2}
         candidates.sort(
             key=lambda row: (
@@ -389,12 +474,12 @@ if "watchlist_text" not in st.session_state:
     st.session_state.watchlist_text = default_watchlist()
 
 if "profile_select" not in st.session_state:
-    st.session_state.profile_select = "Crash recovery"
+    st.session_state.profile_select = "High-conviction recovery"
 if "min_score_control" not in st.session_state:
-    st.session_state.min_score_control = int(PROFILE_SETTINGS["Crash recovery"]["min_score"])
+    st.session_state.min_score_control = int(PROFILE_SETTINGS["High-conviction recovery"]["min_score"])
 if "min_rel_volume_control" not in st.session_state:
     st.session_state.min_rel_volume_control = float(
-        PROFILE_SETTINGS["Crash recovery"]["min_rel_volume"]
+        PROFILE_SETTINGS["High-conviction recovery"]["min_rel_volume"]
     )
 
 def reset_profile_controls() -> None:
@@ -425,6 +510,7 @@ with st.expander("Watchlist and scan settings", expanded=False):
         profile = st.selectbox(
             "Scan profile",
             options=[
+                "High-conviction recovery",
                 "Crash recovery",
                 "Fresh momentum",
                 "Fresh momentum — broader",
@@ -435,9 +521,9 @@ with st.expander("Watchlist and scan settings", expanded=False):
             key="profile_select",
             on_change=reset_profile_controls,
             help=(
-                "Crash recovery is a ranked watchlist for deeply sold-off names that are bouncing or building a reversal. "
-                "It labels each result as WATCH, BUILDING, or TRIGGERED instead of requiring every name "
-                "to break out during the exact scan hour."
+                "High-conviction recovery is the trimmed entry-only mode. It returns only a small, ranked list of deeply sold-off "
+                "stocks with a recent volume-backed recovery breakout, controlled stop distance, and meaningful target room. "
+                "Crash recovery remains the wider discovery watchlist."
             ),
         )
     with controls_2:
@@ -452,20 +538,24 @@ with st.expander("Watchlist and scan settings", expanded=False):
         include_prepost = st.checkbox("Include premarket / after-hours", value=True)
 
     controls_4, controls_5, controls_6 = st.columns(3)
-    if profile == "Crash recovery":
-        # Crash recovery is a ranked watchlist. Its candidate function deliberately
-        # ignores the normal score / exact-bar relative-volume gates, so do not
-        # render those controls here. This also prevents a stale Streamlit session
-        # value (for example, score=40) from violating the ordinary slider's
-        # minimum of 45 after a deployment.
+    if profile in {"Crash recovery", "High-conviction recovery"}:
+        # Recovery profiles have intentionally fixed, profile-specific rules.
+        # Keeping the ordinary sliders hidden prevents stale Streamlit session
+        # values from turning a curated profile into an unbounded watchlist.
         min_score = int(PROFILE_SETTINGS[profile]["min_score"])
         min_rel_volume = float(PROFILE_SETTINGS[profile]["min_rel_volume"])
         with controls_4:
             st.caption("Setup-score filter")
-            st.info("Not used in Crash recovery")
+            if profile == "High-conviction recovery":
+                st.info(f"Fixed at {min_score} for entry-quality filtering")
+            else:
+                st.info("Not used in Crash recovery")
         with controls_5:
             st.caption("Current-bar relative-volume filter")
-            st.info("Not used in Crash recovery")
+            if profile == "High-conviction recovery":
+                st.info("Fixed by the recent-breakout volume rules")
+            else:
+                st.info("Not used in Crash recovery")
     else:
         # Session state can survive a Streamlit Cloud deployment. Clamp stale
         # crash-recovery values before constructing the ordinary profile sliders.
@@ -530,15 +620,28 @@ with st.expander("Watchlist and scan settings", expanded=False):
                 step=1.0,
                 help="Excludes mature rebounds while allowing damaged names whose recovery started more than a few hours ago.",
             )
+        high_conviction_max_candidates = None
         st.caption(
-            "Crash recovery is exact-only: it never emits normal uptrend, breakout, or near-high continuation rows. "
-            "It is a recovery watchlist, so it labels each name as WATCH, BUILDING, or TRIGGERED. "
-            "EMA20/EMA50 and volume help rank the rows but are not hard gates."
+            "Crash recovery is the wide discovery watchlist. It emits WATCH, BUILDING, or TRIGGERED rows and is not the profile for a short entry list."
+        )
+    elif profile == "High-conviction recovery":
+        crash_min_drawdown = None
+        crash_high_lookback = None
+        crash_max_recovery = None
+        high_conviction_max_candidates = st.select_slider(
+            "Maximum candidates to show",
+            options=[3, 5, 8],
+            value=5,
+            help="The scanner returns only the best-ranked qualified entries. It does not fill the list with weaker names when fewer qualify.",
+        )
+        st.caption(
+            "Entry-only rules: still at least 20% below the pre-crash high; at least 12% runway to the crash midpoint; 4%–35% off the crash low; a volume-backed local breakout within the last 2 completed hours; price holding above a rising EMA20; average hourly dollar volume at least $5M; stop risk no more than 3.5%; at least 3% practical target and 1.40 reward/risk."
         )
     else:
         crash_min_drawdown = None
         crash_high_lookback = None
         crash_max_recovery = None
+        high_conviction_max_candidates = None
 
     show_debug = st.checkbox("Show classifications and data errors after scan", value=True)
 
@@ -546,6 +649,10 @@ with st.expander("Watchlist and scan settings", expanded=False):
         st.caption(
             "The practical target is capped at the first meaningful overhead resistance; it can be below the 5% UI target. "
             "The table includes the highest hourly high before the selected recovery low within the selected lookback; it is not a literal all-time high."
+        )
+    elif profile == "High-conviction recovery":
+        st.caption(
+            "This profile intentionally sacrifices the earliest bounce to reduce false starts. Remaining upside to the pre-crash midpoint is shown as potential, while Target is the nearer trade-management objective."
         )
     elif profile.startswith("Fresh momentum"):
         st.caption(
@@ -577,6 +684,8 @@ if run_clicked:
         args.crash_recovery_min_drawdown_pct = float(crash_min_drawdown)
         args.crash_recovery_high_lookback_bars = int(crash_high_lookback)
         args.crash_recovery_max_recovery_from_low_pct = float(crash_max_recovery)
+    elif profile == "High-conviction recovery":
+        args.crash_recovery_max_results = int(high_conviction_max_candidates)
 
     progress = st.progress(0, text="Starting scan…")
     last_ticker = st.empty()
@@ -620,7 +729,11 @@ metric_1.metric("Potential long entries", len(good_entries))
 metric_2.metric("Classified tickers", len(classifications))
 metric_3.metric("Data errors / unavailable", len(errors))
 
-st.subheader("Crash-recovery candidates" if profile == "Crash recovery" else "Good long-entry candidates")
+st.subheader(
+    "High-conviction recovery candidates" if profile == "High-conviction recovery"
+    else "Crash-recovery candidates" if profile == "Crash recovery"
+    else "Good long-entry candidates"
+)
 
 if good_entries.empty:
     st.warning(
@@ -635,6 +748,7 @@ else:
         "Action",
         "RecoveryStatus",
         "EntryReadiness",
+        "QualityScore",
         "Score",
         "LastCompletedHourlyBar",
         "Entry",
@@ -654,6 +768,8 @@ else:
         "RecoveryTriggerFreshnessBars",
         "RecentPositiveBars",
         "RecentMaxRelVol20",
+        "TriggerRelVol20",
+        "UpsideToCrashMidpoint_pct",
         "VolumeConfirmed",
         "ShortTermSupport",
         "ResistanceDistance_pct",
@@ -666,6 +782,7 @@ else:
         use_container_width=True,
         hide_index=True,
         column_config={
+            "QualityScore": st.column_config.NumberColumn(format="%d"),
             "Score": st.column_config.NumberColumn(format="%d"),
             "Entry": st.column_config.NumberColumn(format="$%.2f"),
             "Stop": st.column_config.NumberColumn(format="$%.2f"),
@@ -680,6 +797,8 @@ else:
             "DrawdownFromCrashHigh_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "RecoveryFromCrashLow_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "RecentMaxRelVol20": st.column_config.NumberColumn(format="%.2f×"),
+            "TriggerRelVol20": st.column_config.NumberColumn(format="%.2f×"),
+            "UpsideToCrashMidpoint_pct": st.column_config.NumberColumn(format="%.2f%%"),
             "ResistanceDistance_pct": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
@@ -695,8 +814,8 @@ else:
     with st.expander("How to read these results", expanded=False):
         st.markdown(
             f"""
-- **CRASH_RECOVERY** is a ranked watchlist for stocks that remain materially below their pre-crash high. It never emits normal near-high breakout or uptrend candidates.
-- **RecoveryStatus = TRIGGERED** means the latest completed hourly bar broke local short-term structure. **BUILDING** means the rebound is constructive or a trigger happened recently. **WATCH** means the name has started a rebound but has not yet shown enough short-term confirmation; it is not an entry instruction.
+- **HIGH_CONVICTION_CRASH_RECOVERY** is the entry-only profile. It returns at most the selected number of names and does not pad the table with weaker rows. Every returned row has a recent volume-backed local breakout, price holding above a rising EMA20, a contained structural stop, and usable target room.
+- **CRASH_RECOVERY** remains the wide recovery watchlist. Its **TRIGGERED**, **BUILDING**, and **WATCH** labels are for discovery, not automatic entry.
 - **HighestBeforeCrash** is the highest hourly high *before* the selected crash low inside the selected lookback. It is a pre-crash reference, **not** literal all-time-high data.
 - **CrashLow** is the lowest hourly low found in the recovery-reference window. **RecoveryFromCrashLow_pct** shows how much of the initial rebound has already occurred.
 - **DrawdownFromCrashHigh_pct** is the remaining percentage below the pre-crash high. More negative means the stock is still further below that reference.
