@@ -59,6 +59,15 @@ class ScanConfig:
     # unrealistically high extrinsic value versus the current stock price.
     # This protects against stale / out-of-sync Yahoo option-chain quotes.
     max_call_bid_extrinsic_pct_of_spot: float = 2.0
+    # Covered-call only: Yahoo option bids can be stale versus Robinhood/live quotes,
+    # especially after large stock moves. Treat this as a required extra cushion.
+    # Example: if target return is 1.0% and this is 1.5%, Yahoo must show at least
+    # 2.5% assignment profit before the row qualifies.
+    covered_call_live_quote_safety_pct: float = 1.5
+    # Covered-call only: large same-day stock moves make third-party option quotes
+    # unreliable for tiny edge calculations. Reject names whose underlying moved
+    # more than this percent today. Set 0 to disable.
+    max_cc_underlying_day_change_abs_pct: float = 5.0
     # Applied only to cash-secured puts. This caps the underlying share price,
     # not the strike/collateral. Set to None to disable the cap.
     max_csp_underlying_price: float | None = 451.0
@@ -211,6 +220,47 @@ def fetch_spot(ticker_obj: yf.Ticker, include_extended: bool) -> tuple[float, st
     raise ValueError("Unable to obtain a valid underlying price from Yahoo")
 
 
+
+def fetch_previous_close(ticker_obj: yf.Ticker) -> float:
+    """Best-effort previous regular-session close from Yahoo.
+
+    Used only as a quote-reliability guard for covered calls. If unavailable,
+    return NaN and do not reject the ticker on day-change grounds.
+    """
+    try:
+        fast = ticker_obj.fast_info
+        for key in ("previousClose", "previous_close", "regularMarketPreviousClose"):
+            value = safe_float(fast.get(key))
+            if value > 0:
+                return value
+    except Exception:
+        pass
+
+    try:
+        history = ticker_obj.history(
+            period="10d",
+            interval="1d",
+            auto_adjust=False,
+            prepost=False,
+            raise_errors=False,
+        )
+        close = pd.to_numeric(history.get("Close"), errors="coerce").dropna()
+        if len(close) >= 2:
+            return safe_float(close.iloc[-2])
+        if len(close) == 1:
+            return safe_float(close.iloc[-1])
+    except Exception:
+        pass
+
+    return math.nan
+
+
+def day_change_pct(spot: float, previous_close: float) -> float:
+    if not math.isfinite(spot) or not math.isfinite(previous_close) or previous_close <= 0:
+        return math.nan
+    return (spot - previous_close) / previous_close * 100.0
+
+
 def quote_mark(bid: float, ask: float) -> float:
     if bid > 0 and ask >= bid:
         return (bid + ask) / 2.0
@@ -344,8 +394,9 @@ def select_covered_call(
     config: ScanConfig,
     spot_source: str,
     spot_timestamp: str | None,
+    underlying_day_change_pct: float = math.nan,
 ) -> tuple[dict | None, str]:
-    """Select the lowest-strike qualifying covered call under the legacy logic."""
+    """Select the lowest-strike qualifying covered call with quote-reliability guards."""
     frame = _normalise_chain(calls)
     if frame.empty:
         return None, "Yahoo returned an empty call chain"
@@ -359,6 +410,10 @@ def select_covered_call(
     frame["StrikeDiscount_pct"] = (spot - frame["strike"]) / spot * 100.0
     frame["AssignmentBreakEven"] = frame["strike"] + frame["PremiumUsed"]
     frame["AssignmentProfit_pct"] = (frame["AssignmentBreakEven"] - spot) / spot * 100.0
+    frame["SafetyAdjustedAssignmentProfit_pct"] = (
+        frame["AssignmentProfit_pct"] - float(config.covered_call_live_quote_safety_pct)
+    )
+    frame["UnderlyingDayChange_pct"] = underlying_day_change_pct
     frame["MaxFallBeforeCoveredCallLoss_pct"] = frame["PremiumUsed"] / spot * 100.0
     frame["CoveredCallDownsideBreakeven"] = spot - frame["PremiumUsed"]
 
@@ -366,12 +421,23 @@ def select_covered_call(
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
     )
     quote_sane = call_quote_sanity_mask(frame, spot, config)
+    if (
+        config.max_cc_underlying_day_change_abs_pct > 0
+        and math.isfinite(underlying_day_change_pct)
+        and abs(underlying_day_change_pct) > config.max_cc_underlying_day_change_abs_pct
+    ):
+        day_move_ok = pd.Series(False, index=frame.index)
+    else:
+        day_move_ok = pd.Series(True, index=frame.index)
+
     qualifying = frame.loc[
         (frame["strike"] > 0)
         & (frame["PremiumUsed"] > 0)
         & (frame["StrikeDiscount_pct"] >= config.min_strike_discount_pct)
         & (frame["AssignmentProfit_pct"] >= config.min_return_pct)
+        & (frame["SafetyAdjustedAssignmentProfit_pct"] >= config.min_return_pct)
         & (frame["AssignmentProfit_pct"] <= config.max_return_pct)
+        & day_move_ok
         & (frame["openInterest"].fillna(0) >= config.min_open_interest)
         & (frame["volume"].fillna(0) >= config.min_option_volume)
         & spread_ok
@@ -380,6 +446,31 @@ def select_covered_call(
     ].copy()
 
     if qualifying.empty:
+        if (
+            config.max_cc_underlying_day_change_abs_pct > 0
+            and math.isfinite(underlying_day_change_pct)
+            and abs(underlying_day_change_pct) > config.max_cc_underlying_day_change_abs_pct
+        ):
+            return None, (
+                f"Rejected covered-call scan because underlying moved {underlying_day_change_pct:.2f}% today; "
+                f"Yahoo option-chain bids are too unreliable for small CC edge calculations after moves above "
+                f"{config.max_cc_underlying_day_change_abs_pct:.2f}%"
+            )
+
+        near_without_buffer = frame.loc[
+            (frame["strike"] > 0)
+            & (frame["PremiumUsed"] > 0)
+            & (frame["StrikeDiscount_pct"] >= config.min_strike_discount_pct)
+            & (frame["AssignmentProfit_pct"] >= config.min_return_pct)
+            & (frame["SafetyAdjustedAssignmentProfit_pct"] < config.min_return_pct)
+        ]
+        if not near_without_buffer.empty:
+            return None, (
+                "No call passed the broker-safety buffer. Yahoo showed possible profit, "
+                f"but after subtracting a {config.covered_call_live_quote_safety_pct:.2f}% live-quote safety cushion, "
+                "it no longer met the target."
+            )
+
         stale_like = frame.loc[
             (frame["strike"] > 0)
             & (frame["PremiumUsed"] > 0)
@@ -427,6 +518,15 @@ def select_covered_call(
         "MarkExtrinsic": round_or_nan(safe_float(chosen["MarkExtrinsic"])),
         "AssignmentBreakEven": round_or_nan(safe_float(chosen["AssignmentBreakEven"])),
         "AssignmentProfit_pct": round_or_nan(safe_float(chosen["AssignmentProfit_pct"])),
+        "SafetyAdjustedAssignmentProfit_pct": round_or_nan(
+            safe_float(chosen["SafetyAdjustedAssignmentProfit_pct"])
+        ),
+        "UnderlyingDayChange_pct": round_or_nan(
+            safe_float(chosen["UnderlyingDayChange_pct"])
+        ),
+        "LiveQuoteSafetyBuffer_pct": round_or_nan(
+            float(config.covered_call_live_quote_safety_pct)
+        ),
         "MaxFallBeforeCoveredCallLoss_pct": round_or_nan(
             safe_float(chosen["MaxFallBeforeCoveredCallLoss_pct"])
         ),
@@ -586,6 +686,8 @@ def scan_one_ticker(
                 ticker_obj,
                 config.include_extended_spot,
             )
+            previous_close = fetch_previous_close(ticker_obj)
+            underlying_day_change = day_change_pct(spot, previous_close)
 
             # A share-price cap helps keep one-contract CSP collateral within
             # the user's intended account size. It does not replace the broker's
@@ -642,6 +744,7 @@ def scan_one_ticker(
                     config=config,
                     spot_source=spot_source,
                     spot_timestamp=spot_timestamp,
+                    underlying_day_change_pct=underlying_day_change,
                 )
 
             diagnostic = {
@@ -655,6 +758,17 @@ def scan_one_ticker(
                 "MaxCspUnderlyingPrice": (
                     round_or_nan(config.max_csp_underlying_price)
                     if config.max_csp_underlying_price is not None
+                    else math.nan
+                ),
+                "UnderlyingDayChange_pct": round_or_nan(underlying_day_change),
+                "LiveQuoteSafetyBuffer_pct": (
+                    round_or_nan(config.covered_call_live_quote_safety_pct)
+                    if config.strategy == "covered_call"
+                    else math.nan
+                ),
+                "MaxCcDayMove_pct": (
+                    round_or_nan(config.max_cc_underlying_day_change_abs_pct)
+                    if config.strategy == "covered_call"
                     else math.nan
                 ),
                 "Result": "QUALIFIED" if candidate is not None else "NO_MATCH",
@@ -813,6 +927,18 @@ def parse_args() -> argparse.Namespace:
         help="Covered-call only: reject likely stale quotes where call bid contains more extrinsic value than this percent of spot.",
     )
     parser.add_argument(
+        "--covered-call-live-quote-safety-pct",
+        type=float,
+        default=1.5,
+        help="Covered-call only: require this extra percent of Yahoo assignment profit as a cushion against stale broker quotes.",
+    )
+    parser.add_argument(
+        "--max-cc-underlying-day-change-abs-pct",
+        type=float,
+        default=5.0,
+        help="Covered-call only: reject stocks whose current spot is more than this percent away from the previous close. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--max-csp-underlying-price",
         type=float,
         default=451.0,
@@ -846,6 +972,8 @@ def main() -> None:
         min_option_volume=args.min_option_volume,
         max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
         max_call_bid_extrinsic_pct_of_spot=args.max_call_bid_extrinsic_pct_of_spot,
+        covered_call_live_quote_safety_pct=args.covered_call_live_quote_safety_pct,
+        max_cc_underlying_day_change_abs_pct=args.max_cc_underlying_day_change_abs_pct,
         max_csp_underlying_price=(
             args.max_csp_underlying_price
             if args.max_csp_underlying_price > 0
