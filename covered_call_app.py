@@ -96,15 +96,15 @@ def add_robinhood_review_columns(frame: pd.DataFrame, strategy: str) -> pd.DataF
 
 
 def candidate_columns(strategy: str) -> list[str]:
-    """Keep the detailed table columns while adding Robinhood review links.
+    """Detailed table with the noisy review/debug columns hidden.
 
-    The prior compact table hid too much detail. This restores the full quote,
-    spread, intrinsic/extrinsic, breakeven, and contract-symbol columns.
+    Keep the broker link, quote fields, breakeven/profit fields, liquidity,
+    and contract symbol. Hide the long manual instruction column and the
+    columns the user said were cluttering the table.
     """
     common = [
         "Ticker",
         "RobinhoodChain",
-        "OrderToFind",
         "Spot",
         "Expiry",
         "DaysToExpiry",
@@ -129,7 +129,6 @@ def candidate_columns(strategy: str) -> list[str]:
             "PutBreakeven",
             "MaxFallBeforePutLoss_pct",
             "EstimatedAbsPutDelta",
-            "BidAskSpread_pct",
             "OpenInterest",
             "OptionVolume",
             "ImpliedVolatility_pct",
@@ -140,15 +139,10 @@ def candidate_columns(strategy: str) -> list[str]:
 
     return common + [
         "StrikePlusPremium",
-        "StockMoveNeeded_pct",
-        "CallIntrinsic",
-        "BidExtrinsic",
-        "MarkExtrinsic",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
         "MaxFallBeforeCoveredCallLoss_pct",
         "CoveredCallDownsideBreakeven",
-        "BidAskSpread_pct",
         "OpenInterest",
         "OptionVolume",
         "ImpliedVolatility_pct",
@@ -164,10 +158,6 @@ def candidate_column_config(strategy: str) -> dict:
             "Robinhood chain",
             display_text="Open chain",
             help="Opens Robinhood's option-chain page for this ticker. Manually select the exact expiration, strike, call/put side, Sell action, and limit price.",
-        ),
-        "OrderToFind": st.column_config.TextColumn(
-            "Option to find",
-            help="Manual checklist for the option chain after opening Robinhood.",
         ),
         "Spot": st.column_config.NumberColumn("Spot", format="$%.2f"),
         "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
@@ -236,22 +226,6 @@ def candidate_column_config(strategy: str) -> dict:
                     format="$%.2f",
                     help="Strike plus premium used. Same economics as AssignmentBreakEven before fees and taxes.",
                 ),
-                "StockMoveNeeded_pct": st.column_config.NumberColumn(
-                    "Needed move",
-                    format="%.2f%%",
-                    help="(Strike + premium − current stock price) / current stock price.",
-                ),
-                "CallIntrinsic": st.column_config.NumberColumn(
-                    "Intrinsic value",
-                    format="$%.2f",
-                    help="max(spot - strike, 0). Used to detect stale deep-ITM call quotes.",
-                ),
-                "BidExtrinsic": st.column_config.NumberColumn(
-                    "Bid extrinsic",
-                    format="$%.2f",
-                    help="Bid minus intrinsic value. Very high values on deep-ITM calls are usually stale/out-of-sync quotes.",
-                ),
-                "MarkExtrinsic": st.column_config.NumberColumn("Mark extrinsic", format="$%.2f"),
                 "AssignmentBreakEven": st.column_config.NumberColumn(
                     "AssignmentBreakEven",
                     format="$%.2f",
@@ -525,7 +499,7 @@ if "option_income_output" in st.session_state:
         )
 
         st.caption(
-            "Robinhood links open the ticker option-chain page, not a prefilled order. Manually match the exact expiration, strike, call/put side, and Sell action shown in `Option to find`."
+            "Robinhood links open the ticker option-chain page, not a prefilled order. Manually match the exact expiration, strike, call/put side, Sell action, and live bid before submitting."
         )
 
         if displayed_strategy == "cash_secured_put":
@@ -544,7 +518,7 @@ if "option_income_output" in st.session_state:
 
         st.download_button(
             "Download candidates CSV",
-            data=candidates_for_display.to_csv(index=False).encode("utf-8"),
+            data=visible.to_csv(index=False).encode("utf-8"),
             file_name=filename,
             mime="text/csv",
             use_container_width=True,
