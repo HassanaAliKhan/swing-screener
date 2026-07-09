@@ -141,6 +141,8 @@ def candidate_columns(strategy: str) -> list[str]:
         "StrikePlusPremium",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
+        "SafetyAdjustedAssignmentProfit_pct",
+        "UnderlyingDayChange_pct",
         "MaxFallBeforeCoveredCallLoss_pct",
         "CoveredCallDownsideBreakeven",
         "OpenInterest",
@@ -232,6 +234,16 @@ def candidate_column_config(strategy: str) -> dict:
                     help="Strike plus premium used; this is the final stock price needed for the covered-call package to be profitable before fees/taxes.",
                 ),
                 "AssignmentProfit_pct": st.column_config.NumberColumn("AssignmentProfit_pct", format="%.2f%%"),
+                "SafetyAdjustedAssignmentProfit_pct": st.column_config.NumberColumn(
+                    "Safety-adjusted profit",
+                    format="%.2f%%",
+                    help="Yahoo assignment profit minus the live-quote safety buffer. This is the value filtered against your minimum assignment profit.",
+                ),
+                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
+                    "Stock day move",
+                    format="%.2f%%",
+                    help="Current spot versus previous close. Large same-day moves make Yahoo option bids less reliable versus Robinhood.",
+                ),
                 "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn("MaxFallBeforeCoveredCallLoss_pct", format="%.2f%%"),
                 "CoveredCallDownsideBreakeven": st.column_config.NumberColumn("CoveredCallDownsideBreakeven", format="$%.2f"),
             }
@@ -378,7 +390,17 @@ with st.expander("Watchlist and scan settings", expanded=True):
             )
         else:
             max_abs_put_delta = 1.0
-            st.caption("Covered-call mode rejects likely stale deep-ITM quotes when bid extrinsic is above 2% of spot.")
+            cc_live_quote_safety = st.number_input(
+                "CC live-quote safety buffer (%)",
+                min_value=0.0,
+                max_value=5.0,
+                value=1.5,
+                step=0.25,
+                help=(
+                    "Yahoo/yfinance option bids can be stale versus Robinhood. "
+                    "The scanner subtracts this buffer from Yahoo assignment profit before deciding whether a covered call qualifies."
+                ),
+            )
     with row3[1]:
         if strategy == "cash_secured_put":
             max_csp_underlying_price = st.number_input(
@@ -399,7 +421,17 @@ with st.expander("Watchlist and scan settings", expanded=True):
             )
         else:
             max_csp_underlying_price = None
-            st.caption("Maximum underlying price is used only in cash-secured-put mode.")
+            max_cc_day_move = st.number_input(
+                "Max stock day move for CC (%)",
+                min_value=0.0,
+                max_value=50.0,
+                value=5.0,
+                step=0.5,
+                help=(
+                    "Reject covered-call candidates when the underlying has moved too much today. "
+                    "Large same-day moves often make third-party option quotes stale versus Robinhood."
+                ),
+            )
     with row3[2]:
         workers = st.slider("Yahoo request concurrency", min_value=1, max_value=5, value=3)
     with row3[3]:
@@ -407,6 +439,10 @@ with st.expander("Watchlist and scan settings", expanded=True):
             "Use premarket / after-hours stock price when Yahoo supplies it",
             value=False,
         )
+
+    if strategy == "cash_secured_put":
+        cc_live_quote_safety = 0.0
+        max_cc_day_move = 0.0
 
     show_debug = st.checkbox("Show all ticker diagnostics and data errors", value=True)
 
@@ -431,6 +467,8 @@ if run_scan:
         min_open_interest=int(min_open_interest),
         min_option_volume=int(min_option_volume),
         max_bid_ask_spread_pct=float(max_spread),
+        covered_call_live_quote_safety_pct=float(cc_live_quote_safety),
+        max_cc_underlying_day_change_abs_pct=float(max_cc_day_move),
         max_csp_underlying_price=(
             float(max_csp_underlying_price)
             if strategy == "cash_secured_put"
@@ -499,7 +537,7 @@ if "option_income_output" in st.session_state:
         )
 
         st.caption(
-            "Robinhood links open the ticker option-chain page, not a prefilled order. Manually match the exact expiration, strike, call/put side, Sell action, and live bid before submitting."
+            "Robinhood links open the ticker option-chain page, not a prefilled order. Manually match the exact expiration, strike, call/put side, Sell action, and live bid before submitting. Covered-call rows use a safety-adjusted profit filter because Yahoo bids can be stale versus Robinhood."
         )
 
         if displayed_strategy == "cash_secured_put":
