@@ -79,6 +79,9 @@ def candidate_columns(strategy: str) -> list[str]:
         ]
 
     return common + [
+        "CallIntrinsic",
+        "BidExtrinsic",
+        "MarkExtrinsic",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
         "MaxFallBeforeCoveredCallLoss_pct",
@@ -149,6 +152,20 @@ def candidate_column_config(strategy: str) -> dict:
     else:
         config.update(
             {
+                "CallIntrinsic": st.column_config.NumberColumn(
+                    "Intrinsic value",
+                    format="$%.2f",
+                    help="max(spot - strike, 0). Used to detect stale deep-ITM call quotes.",
+                ),
+                "BidExtrinsic": st.column_config.NumberColumn(
+                    "Bid extrinsic",
+                    format="$%.2f",
+                    help="Bid minus intrinsic value. Very high values on deep-ITM calls are usually stale/out-of-sync quotes.",
+                ),
+                "MarkExtrinsic": st.column_config.NumberColumn(
+                    "Mark extrinsic",
+                    format="$%.2f",
+                ),
                 "AssignmentBreakEven": st.column_config.NumberColumn(format="$%.2f"),
                 "AssignmentProfit_pct": st.column_config.NumberColumn(format="%.2f%%"),
                 "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn(format="%.2f%%"),
@@ -298,7 +315,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
             )
         else:
             max_abs_put_delta = 1.0
-            st.caption("Estimated put delta is used only in cash-secured-put mode.")
+            st.caption("Covered-call mode rejects likely stale deep-ITM quotes when bid extrinsic is above 2% of spot.")
     with row3[1]:
         if strategy == "cash_secured_put":
             max_csp_underlying_price = st.number_input(
