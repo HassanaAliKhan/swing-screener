@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -46,9 +47,64 @@ def strategy_button_text(strategy: str) -> str:
     return "Run cash-secured-put scan" if strategy == "cash_secured_put" else "Run covered-call scan"
 
 
+def robinhood_option_chain_url(ticker: object) -> str:
+    """Open Robinhood's option-chain page for the ticker.
+
+    This is intentionally a review link, not a prefilled order. Robinhood may
+    still require login and manual selection of expiration, strike, side, and
+    Sell/Buy action.
+    """
+    symbol = quote(str(ticker).strip().upper(), safe="")
+    return f"https://robinhood.com/options/chains/{symbol}"
+
+
+def option_action_note(row: pd.Series, strategy: str) -> str:
+    side = "PUT" if strategy == "cash_secured_put" else "CALL"
+    action = "SELL PUT / CSP" if strategy == "cash_secured_put" else "SELL CALL / CC"
+    expiry = str(row.get("Expiry", "")).strip()
+    strike = pd.to_numeric(pd.Series([row.get("Strike")]), errors="coerce").iloc[0]
+    bid = pd.to_numeric(pd.Series([row.get("Bid")]), errors="coerce").iloc[0]
+
+    strike_text = f"${strike:.2f}" if pd.notna(strike) else "strike?"
+    bid_text = f"bid ${bid:.2f}" if pd.notna(bid) else "bid?"
+    return f"{action}: {expiry} {strike_text} {side} | {bid_text}"
+
+
+def add_robinhood_review_columns(frame: pd.DataFrame, strategy: str) -> pd.DataFrame:
+    result = frame.copy()
+    if result.empty or "Ticker" not in result.columns:
+        return result
+
+    result["RobinhoodChain"] = result["Ticker"].map(robinhood_option_chain_url)
+    result["OrderToFind"] = result.apply(lambda row: option_action_note(row, strategy), axis=1)
+
+    strike = pd.to_numeric(result.get("Strike"), errors="coerce")
+    premium = pd.to_numeric(result.get("PremiumUsed"), errors="coerce")
+    spot = pd.to_numeric(result.get("Spot"), errors="coerce")
+
+    if strategy == "covered_call":
+        # This is the number the user asked for: strike + premium received.
+        # If the stock is at/above this by assignment, the covered-call package
+        # is at or above breakeven/profit before fees and taxes.
+        result["StrikePlusPremium"] = strike + premium
+        result["StockMoveNeeded_pct"] = (result["StrikePlusPremium"] - spot) / spot * 100.0
+    else:
+        # CSP equivalent: effective stock basis after received premium.
+        result["EffectiveBuyPrice"] = strike - premium
+
+    return result
+
+
 def candidate_columns(strategy: str) -> list[str]:
+    """Keep the detailed table columns while adding Robinhood review links.
+
+    The prior compact table hid too much detail. This restores the full quote,
+    spread, intrinsic/extrinsic, breakeven, and contract-symbol columns.
+    """
     common = [
         "Ticker",
+        "RobinhoodChain",
+        "OrderToFind",
         "Spot",
         "Expiry",
         "DaysToExpiry",
@@ -68,6 +124,8 @@ def candidate_columns(strategy: str) -> list[str]:
             "CashCollateral_perContract",
             "PremiumCredit_perContract",
             "PremiumYieldOnCollateral_pct",
+            "PremiumYieldOnSpot_pct",
+            "EffectiveBuyPrice",
             "PutBreakeven",
             "MaxFallBeforePutLoss_pct",
             "EstimatedAbsPutDelta",
@@ -75,10 +133,14 @@ def candidate_columns(strategy: str) -> list[str]:
             "OpenInterest",
             "OptionVolume",
             "ImpliedVolatility_pct",
+            "InTheMoney",
+            "LastTradeDate",
             "ContractSymbol",
         ]
 
     return common + [
+        "StrikePlusPremium",
+        "StockMoveNeeded_pct",
         "CallIntrinsic",
         "BidExtrinsic",
         "MarkExtrinsic",
@@ -90,68 +152,95 @@ def candidate_columns(strategy: str) -> list[str]:
         "OpenInterest",
         "OptionVolume",
         "ImpliedVolatility_pct",
+        "InTheMoney",
+        "LastTradeDate",
         "ContractSymbol",
     ]
 
 
 def candidate_column_config(strategy: str) -> dict:
     config = {
-        "Spot": st.column_config.NumberColumn(format="$%.2f"),
-        "Strike": st.column_config.NumberColumn(format="$%.2f"),
-        "Bid": st.column_config.NumberColumn(format="$%.2f"),
-        "Ask": st.column_config.NumberColumn(format="$%.2f"),
-        "Mark": st.column_config.NumberColumn(format="$%.2f"),
+        "RobinhoodChain": st.column_config.LinkColumn(
+            "Robinhood chain",
+            display_text="Open chain",
+            help="Opens Robinhood's option-chain page for this ticker. Manually select the exact expiration, strike, call/put side, Sell action, and limit price.",
+        ),
+        "OrderToFind": st.column_config.TextColumn(
+            "Option to find",
+            help="Manual checklist for the option chain after opening Robinhood.",
+        ),
+        "Spot": st.column_config.NumberColumn("Spot", format="$%.2f"),
+        "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
+        "Bid": st.column_config.NumberColumn("Bid", format="$%.2f"),
+        "Ask": st.column_config.NumberColumn("Ask", format="$%.2f"),
+        "Mark": st.column_config.NumberColumn("Mark", format="$%.2f"),
         "MarkBidGap": st.column_config.NumberColumn(
             "Mark − Bid",
             format="$%.2f",
             help="Midpoint mark minus bid. Smaller is closer to the bid used as a conservative execution reference.",
         ),
-        "MarkBidGap_pct": st.column_config.NumberColumn(
-            "Mark − Bid %",
-            format="%.2f%%",
-        ),
-        "PremiumUsed": st.column_config.NumberColumn(format="$%.2f"),
-        "StrikeDiscount_pct": st.column_config.NumberColumn(format="%.2f%%"),
-        "BidAskSpread_pct": st.column_config.NumberColumn(format="%.2f%%"),
-        "ImpliedVolatility_pct": st.column_config.NumberColumn(format="%.2f%%"),
+        "MarkBidGap_pct": st.column_config.NumberColumn("Mark − Bid %", format="%.2f%%"),
+        "PremiumUsed": st.column_config.NumberColumn("PremiumUsed", format="$%.2f"),
+        "StrikeDiscount_pct": st.column_config.NumberColumn("StrikeDiscount_pct", format="%.2f%%"),
+        "BidAskSpread_pct": st.column_config.NumberColumn("BidAskSpread_pct", format="%.2f%%"),
+        "ImpliedVolatility_pct": st.column_config.NumberColumn("ImpliedVolatility_pct", format="%.2f%%"),
+        "OpenInterest": st.column_config.NumberColumn("OpenInterest"),
+        "OptionVolume": st.column_config.NumberColumn("OptionVolume"),
     }
 
     if strategy == "cash_secured_put":
         config.update(
             {
                 "CashCollateral_perContract": st.column_config.NumberColumn(
-                    "Cash collateral / contract",
+                    "CashCollateral_perContract",
                     format="$%.0f",
                 ),
                 "PremiumCredit_perContract": st.column_config.NumberColumn(
-                    "Premium credit / contract",
+                    "PremiumCredit_perContract",
                     format="$%.0f",
                 ),
                 "PremiumYieldOnCollateral_pct": st.column_config.NumberColumn(
-                    "Premium yield on collateral",
+                    "PremiumYieldOnCollateral_pct",
                     format="%.2f%%",
-                    help="Premium used divided by strike cash collateral, before fees and taxes.",
+                    help="Premium used divided by strike collateral, before fees and taxes.",
+                ),
+                "PremiumYieldOnSpot_pct": st.column_config.NumberColumn(
+                    "PremiumYieldOnSpot_pct",
+                    format="%.2f%%",
+                ),
+                "EffectiveBuyPrice": st.column_config.NumberColumn(
+                    "Strike − premium",
+                    format="$%.2f",
+                    help="Same economics as PutBreakeven: strike minus premium used.",
                 ),
                 "PutBreakeven": st.column_config.NumberColumn(
-                    "Effective purchase breakeven",
+                    "PutBreakeven",
                     format="$%.2f",
-                    help="Strike minus premium used. Assignment means buying 100 shares at the strike; the premium reduces the economic basis.",
+                    help="Effective stock basis if assigned, before fees and taxes.",
                 ),
                 "MaxFallBeforePutLoss_pct": st.column_config.NumberColumn(
-                    "Max fall before put loss",
+                    "MaxFallBeforePutLoss_pct",
                     format="%.2f%%",
-                    help="Distance from spot to strike minus premium. Higher gives more downside room before an assigned position has an unrealized loss versus current spot.",
                 ),
                 "EstimatedAbsPutDelta": st.column_config.NumberColumn(
-                    "Estimated |put delta|",
+                    "EstimatedAbsPutDelta",
                     format="%.3f",
-                    help="Black-Scholes estimate using Yahoo implied volatility and DTE. It is a risk proxy, not an assignment probability or guarantee.",
                 ),
             }
         )
     else:
         config.update(
             {
+                "StrikePlusPremium": st.column_config.NumberColumn(
+                    "Strike + premium",
+                    format="$%.2f",
+                    help="Strike plus premium used. Same economics as AssignmentBreakEven before fees and taxes.",
+                ),
+                "StockMoveNeeded_pct": st.column_config.NumberColumn(
+                    "Needed move",
+                    format="%.2f%%",
+                    help="(Strike + premium − current stock price) / current stock price.",
+                ),
                 "CallIntrinsic": st.column_config.NumberColumn(
                     "Intrinsic value",
                     format="$%.2f",
@@ -162,19 +251,19 @@ def candidate_column_config(strategy: str) -> dict:
                     format="$%.2f",
                     help="Bid minus intrinsic value. Very high values on deep-ITM calls are usually stale/out-of-sync quotes.",
                 ),
-                "MarkExtrinsic": st.column_config.NumberColumn(
-                    "Mark extrinsic",
+                "MarkExtrinsic": st.column_config.NumberColumn("Mark extrinsic", format="$%.2f"),
+                "AssignmentBreakEven": st.column_config.NumberColumn(
+                    "AssignmentBreakEven",
                     format="$%.2f",
+                    help="Strike plus premium used; this is the final stock price needed for the covered-call package to be profitable before fees/taxes.",
                 ),
-                "AssignmentBreakEven": st.column_config.NumberColumn(format="$%.2f"),
-                "AssignmentProfit_pct": st.column_config.NumberColumn(format="%.2f%%"),
-                "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn(format="%.2f%%"),
-                "CoveredCallDownsideBreakeven": st.column_config.NumberColumn(format="$%.2f"),
+                "AssignmentProfit_pct": st.column_config.NumberColumn("AssignmentProfit_pct", format="%.2f%%"),
+                "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn("MaxFallBeforeCoveredCallLoss_pct", format="%.2f%%"),
+                "CoveredCallDownsideBreakeven": st.column_config.NumberColumn("CoveredCallDownsideBreakeven", format="$%.2f"),
             }
         )
 
     return config
-
 
 st.title("Option-Income Screener")
 st.caption(
@@ -200,7 +289,7 @@ with st.expander("How the strategies work", expanded=False):
 - **Assignment profit** = `(strike + premium used − spot) / spot × 100`.
 - The premium offers only a limited downside cushion while upside is capped at the strike.
 
-The screener is for research and does not place orders. Confirm the live option chain, limit-order fill, earnings date, liquidity, and whether assignment is acceptable before trading.
+The screener is for research and does not place orders. The Robinhood link opens the ticker option-chain page only; manually confirm the exact expiration, strike, call/put side, Sell action, and limit price before submitting any order. Confirm the live option chain, limit-order fill, earnings date, liquidity, and whether assignment is acceptable before trading.
         """
     )
 
@@ -426,12 +515,17 @@ if "option_income_output" in st.session_state:
     if candidates.empty:
         st.info("No option contracts passed every active filter in this scan.")
     else:
-        visible = candidates.reindex(columns=candidate_columns(displayed_strategy)).copy()
+        candidates_for_display = add_robinhood_review_columns(candidates, displayed_strategy)
+        visible = candidates_for_display.reindex(columns=candidate_columns(displayed_strategy)).copy()
         st.dataframe(
             visible,
             use_container_width=True,
             hide_index=True,
             column_config=candidate_column_config(displayed_strategy),
+        )
+
+        st.caption(
+            "Robinhood links open the ticker option-chain page, not a prefilled order. Manually match the exact expiration, strike, call/put side, and Sell action shown in `Option to find`."
         )
 
         if displayed_strategy == "cash_secured_put":
@@ -450,7 +544,7 @@ if "option_income_output" in st.session_state:
 
         st.download_button(
             "Download candidates CSV",
-            data=candidates.to_csv(index=False).encode("utf-8"),
+            data=candidates_for_display.to_csv(index=False).encode("utf-8"),
             file_name=filename,
             mime="text/csv",
             use_container_width=True,
