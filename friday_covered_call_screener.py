@@ -55,6 +55,10 @@ class ScanConfig:
     min_open_interest: int = 25
     min_option_volume: int = 1
     max_bid_ask_spread_pct: float = 15.0
+    # Covered-call only: reject deep-ITM call quotes whose bid contains
+    # unrealistically high extrinsic value versus the current stock price.
+    # This protects against stale / out-of-sync Yahoo option-chain quotes.
+    max_call_bid_extrinsic_pct_of_spot: float = 2.0
     # Applied only to cash-secured puts. This caps the underlying share price,
     # not the strike/collateral. Set to None to disable the cap.
     max_csp_underlying_price: float | None = 451.0
@@ -235,6 +239,26 @@ def bid_ask_spread_pct(bid: float, ask: float) -> float:
     return (ask - bid) / mark * 100.0
 
 
+def call_quote_sanity_mask(frame: pd.DataFrame, spot: float, config: ScanConfig) -> pd.Series:
+    """Reject covered-call quotes that are internally inconsistent with spot.
+
+    For a call, intrinsic value is max(spot - strike, 0). Deep ITM calls can
+    trade a little below/above intrinsic because of spreads and time value, but
+    a bid that is far above intrinsic often means Yahoo's option quote is stale
+    relative to the current stock quote.
+    """
+    if frame.empty:
+        return pd.Series(False, index=frame.index)
+
+    max_extrinsic = max(0.25, spot * float(config.max_call_bid_extrinsic_pct_of_spot) / 100.0)
+    intrinsic = np.maximum(spot - frame["strike"], 0.0)
+    bid_extrinsic = frame["bid"] - intrinsic
+
+    # Allow NaN to fail later through PremiumUsed > 0. Reject only quotes whose
+    # sell-side bid is implausibly rich versus current spot and strike.
+    return bid_extrinsic.isna() | (bid_extrinsic <= max_extrinsic)
+
+
 def normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
 
@@ -329,6 +353,9 @@ def select_covered_call(
     frame["PremiumUsed"] = frame.apply(
         lambda row: premium_from_quote(row, config.premium_basis), axis=1
     )
+    frame["CallIntrinsic"] = np.maximum(spot - frame["strike"], 0.0)
+    frame["BidExtrinsic"] = frame["bid"] - frame["CallIntrinsic"]
+    frame["MarkExtrinsic"] = frame["Mark"] - frame["CallIntrinsic"]
     frame["StrikeDiscount_pct"] = (spot - frame["strike"]) / spot * 100.0
     frame["AssignmentBreakEven"] = frame["strike"] + frame["PremiumUsed"]
     frame["AssignmentProfit_pct"] = (frame["AssignmentBreakEven"] - spot) / spot * 100.0
@@ -338,6 +365,7 @@ def select_covered_call(
     spread_ok = frame["BidAskSpread_pct"].isna() | (
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
     )
+    quote_sane = call_quote_sanity_mask(frame, spot, config)
     qualifying = frame.loc[
         (frame["strike"] > 0)
         & (frame["PremiumUsed"] > 0)
@@ -347,11 +375,23 @@ def select_covered_call(
         & (frame["openInterest"].fillna(0) >= config.min_open_interest)
         & (frame["volume"].fillna(0) >= config.min_option_volume)
         & spread_ok
+        & quote_sane
         & _regular_contract_mask(frame)
     ].copy()
 
     if qualifying.empty:
-        return None, "No call met active strike, return, liquidity, and spread filters"
+        stale_like = frame.loc[
+            (frame["strike"] > 0)
+            & (frame["PremiumUsed"] > 0)
+            & (frame["StrikeDiscount_pct"] >= config.min_strike_discount_pct)
+            & (~quote_sane)
+        ]
+        if not stale_like.empty:
+            return None, (
+                "No call passed after rejecting likely stale Yahoo quotes: "
+                "call bid contained too much extrinsic value versus current spot/strike"
+            )
+        return None, "No call met active strike, return, liquidity, spread, and quote-sanity filters"
 
     qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
     qualifying = qualifying.sort_values(
@@ -382,6 +422,9 @@ def select_covered_call(
         "Last": round_or_nan(safe_float(chosen["lastPrice"])),
         "PremiumBasis": config.premium_basis,
         "PremiumUsed": round_or_nan(safe_float(chosen["PremiumUsed"])),
+        "CallIntrinsic": round_or_nan(safe_float(chosen["CallIntrinsic"])),
+        "BidExtrinsic": round_or_nan(safe_float(chosen["BidExtrinsic"])),
+        "MarkExtrinsic": round_or_nan(safe_float(chosen["MarkExtrinsic"])),
         "AssignmentBreakEven": round_or_nan(safe_float(chosen["AssignmentBreakEven"])),
         "AssignmentProfit_pct": round_or_nan(safe_float(chosen["AssignmentProfit_pct"])),
         "MaxFallBeforeCoveredCallLoss_pct": round_or_nan(
@@ -764,6 +807,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-option-volume", type=int, default=1)
     parser.add_argument("--max-bid-ask-spread-pct", type=float, default=15.0)
     parser.add_argument(
+        "--max-call-bid-extrinsic-pct-of-spot",
+        type=float,
+        default=2.0,
+        help="Covered-call only: reject likely stale quotes where call bid contains more extrinsic value than this percent of spot.",
+    )
+    parser.add_argument(
         "--max-csp-underlying-price",
         type=float,
         default=451.0,
@@ -796,6 +845,7 @@ def main() -> None:
         min_open_interest=args.min_open_interest,
         min_option_volume=args.min_option_volume,
         max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
+        max_call_bid_extrinsic_pct_of_spot=args.max_call_bid_extrinsic_pct_of_spot,
         max_csp_underlying_price=(
             args.max_csp_underlying_price
             if args.max_csp_underlying_price > 0
