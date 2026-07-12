@@ -19,7 +19,7 @@ st.set_page_config(
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
-EXPECTED_BACKEND_VERSION = "2026.07.atm-premium-below-spot-v2"
+EXPECTED_BACKEND_VERSION = "2026.07.atm-premium-v1"
 if getattr(screener, "BACKEND_VERSION", None) != EXPECTED_BACKEND_VERSION:
     st.error(
         "The app and backend files are out of sync. Replace both "
@@ -80,8 +80,8 @@ def strategy_button_text(strategy: str) -> str:
 def candidate_columns(strategy: str) -> list[str]:
     common = [
         "Ticker",
-        "RobinhoodChain",
         "Spot",
+        "RobinhoodChain",
         "Expiry",
         "DaysToExpiry",
         "Strike",
@@ -148,11 +148,21 @@ def candidate_columns(strategy: str) -> list[str]:
 
 def candidate_column_config(strategy: str) -> dict:
     config = {
+        "Ticker": st.column_config.TextColumn(
+            "Ticker",
+            pinned=True,
+            width="small",
+        ),
+        "Spot": st.column_config.NumberColumn(
+            "Spot",
+            format="$%.2f",
+            pinned=True,
+            width="small",
+        ),
         "RobinhoodChain": st.column_config.LinkColumn(
             "Robinhood chain",
             display_text="Open chain",
         ),
-        "Spot": st.column_config.NumberColumn("Spot", format="$%.2f"),
         "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
         "Bid": st.column_config.NumberColumn("Bid", format="$%.2f"),
         "Ask": st.column_config.NumberColumn("Ask", format="$%.2f"),
@@ -257,8 +267,8 @@ def candidate_column_config(strategy: str) -> dict:
 
 st.title("Option-Income Screener")
 st.caption(
-    "The default mode buys 100 shares conceptually, chooses the closest listed call "
-    "strike at or below spot inside your distance limit, and returns the top stocks by call premium "
+    "The default mode buys 100 shares conceptually, chooses the nearest ATM call "
+    "inside your strike-distance limit, and returns the top stocks by call premium "
     "as a percentage of the 100-share investment."
 )
 
@@ -295,16 +305,16 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum ATM strike distance (%)",
                 min_value=0.1,
                 max_value=20.0,
-                value=10.0,
+                value=3.0,
                 step=0.5,
-                help="The selected call strike must be at or below spot and within this percentage below spot.",
+                help="The selected call strike must be within this percentage of spot.",
             )
         with row1[1]:
             min_return = st.number_input(
                 "Minimum premium yield (%)",
                 min_value=0.0,
                 max_value=100.0,
-                value=4.5,
+                value=0.5,
                 step=0.25,
             )
         with row1[2]:
@@ -312,7 +322,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum premium yield (%)",
                 min_value=0.0,
                 max_value=100.0,
-                value=100.0,
+                value=25.0,
                 step=0.5,
             )
         with row1[3]:
@@ -385,7 +395,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
             "Maximum bid-ask spread (%)",
             min_value=1.0,
             max_value=300.0,
-            value=100.0,
+            value=15.0,
             step=1.0,
         )
 
@@ -600,8 +610,8 @@ if "option_income_output" in st.session_state:
         if displayed_strategy == "premium_yield_call":
             st.caption(
                 "Sorted by premium yield on the current 100-share investment. "
-                "The selected contract uses the closest listed strike at or below spot within your "
-                "distance limit. Confirm the live Robinhood bid before buying shares."
+                "The selected contract is the nearest strike to spot within your "
+                "ATM-distance limit. Confirm the live Robinhood bid before buying shares."
             )
             filename = "top_atm_premium_yield_calls.csv"
         elif displayed_strategy == "cash_secured_put":
