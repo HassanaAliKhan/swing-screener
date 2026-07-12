@@ -647,3 +647,4 @@ if "option_income_output" in st.session_state:
                 use_container_width=True,
                 hide_index=True,
             )
+
