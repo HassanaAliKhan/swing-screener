@@ -419,7 +419,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
     with row3[3]:
         include_extended_spot = st.checkbox(
             "Use premarket / after-hours spot",
-            value=False,
+            value=True,
         )
 
     if strategy == "cash_secured_put":
