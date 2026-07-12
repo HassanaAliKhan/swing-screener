@@ -312,7 +312,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum premium yield (%)",
                 min_value=0.0,
                 max_value=100.0,
-                value=25.0,
+                value=100.0,
                 step=0.5,
             )
         with row1[3]:
