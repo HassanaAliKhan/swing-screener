@@ -19,7 +19,7 @@ st.set_page_config(
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
-EXPECTED_BACKEND_VERSION = "2026.07.closest-strike-first-v4"
+EXPECTED_BACKEND_VERSION = "2026.07.closest-strike-positive-profit-v5"
 if getattr(screener, "BACKEND_VERSION", None) != EXPECTED_BACKEND_VERSION:
     st.error(
         "The app and backend files are out of sync. Replace both "
@@ -609,9 +609,11 @@ if "option_income_output" in st.session_state:
 
         if displayed_strategy == "premium_yield_call":
             st.caption(
-                "Sorted first by the largest premium cushion, then by the largest maximum profit if called. "
+                "Only contracts with strictly positive maximum profit if called are shown. "
                 "For each ticker, the closest usable listed strike at or below spot is selected first; "
-                "the premium-yield filter is applied afterward. Confirm the live Robinhood bid before buying shares."
+                "the premium-yield and positive-called-profit filters are applied afterward. "
+                "Results are sorted by premium cushion, then maximum profit if called. "
+                "Confirm the live Robinhood bid before buying shares."
             )
             filename = "top_atm_premium_yield_calls.csv"
         elif displayed_strategy == "cash_secured_put":
