@@ -163,7 +163,7 @@ def candidate_column_config(strategy: str) -> dict:
             "Robinhood chain",
             display_text="Open chain",
         ),
-        "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
+        "Strike": st.column_config.NumberColumn("Strike", format="$%.2f", pinned=True,  width="small"),
         "Bid": st.column_config.NumberColumn("Bid", format="$%.2f"),
         "Ask": st.column_config.NumberColumn("Ask", format="$%.2f"),
         "Mark": st.column_config.NumberColumn("Mark", format="$%.2f"),
