@@ -404,7 +404,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum stock price ($, 0 = no cap)",
                 min_value=0.0,
                 max_value=10_000.0,
-                value=0.0,
+                value=750.0,
                 step=10.0,
             )
         else:
