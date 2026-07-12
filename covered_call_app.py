@@ -305,7 +305,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum ATM strike distance (%)",
                 min_value=0.1,
                 max_value=20.0,
-                value=3.0,
+                value=15.0,
                 step=0.5,
                 help="The selected call strike must be at or below spot and within this percentage below spot.",
             )
@@ -314,7 +314,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Minimum premium yield (%)",
                 min_value=0.0,
                 max_value=100.0,
-                value=0.5,
+                value=4.5,
                 step=0.25,
             )
         with row1[2]:
@@ -322,7 +322,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum premium yield (%)",
                 min_value=0.0,
                 max_value=100.0,
-                value=25.0,
+                value=50.0,
                 step=0.5,
             )
         with row1[3]:
@@ -395,7 +395,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
             "Maximum bid-ask spread (%)",
             min_value=1.0,
             max_value=300.0,
-            value=15.0,
+            value=50.0,
             step=1.0,
         )
 
