@@ -19,7 +19,7 @@ st.set_page_config(
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
-EXPECTED_BACKEND_VERSION = "2026.07.atm-premium-cushion-profit-v3"
+EXPECTED_BACKEND_VERSION = "2026.07.closest-strike-first-v4"
 if getattr(screener, "BACKEND_VERSION", None) != EXPECTED_BACKEND_VERSION:
     st.error(
         "The app and backend files are out of sync. Replace both "
@@ -267,8 +267,8 @@ def candidate_column_config(strategy: str) -> dict:
 
 st.title("Option-Income Screener")
 st.caption(
-    "The default mode buys 100 shares conceptually, chooses the closest listed call "
-    "strike at or below spot inside your distance limit, and returns the top stocks by call premium "
+    "The default mode buys 100 shares conceptually, first chooses the closest usable listed call "
+    "strike at or below spot, and only then checks its premium yield. It returns the top stocks by call premium "
     "as a percentage of the 100-share investment."
 )
 
@@ -610,8 +610,8 @@ if "option_income_output" in st.session_state:
         if displayed_strategy == "premium_yield_call":
             st.caption(
                 "Sorted first by the largest premium cushion, then by the largest maximum profit if called. "
-                "The selected contract uses the closest listed strike at or below spot within your "
-                "distance limit. Confirm the live Robinhood bid before buying shares."
+                "For each ticker, the closest usable listed strike at or below spot is selected first; "
+                "the premium-yield filter is applied afterward. Confirm the live Robinhood bid before buying shares."
             )
             filename = "top_atm_premium_yield_calls.csv"
         elif displayed_strategy == "cash_secured_put":
