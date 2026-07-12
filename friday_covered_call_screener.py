@@ -38,6 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
+BACKEND_VERSION = "2026.07.atm-premium-v1"
 Strategy = Literal["covered_call", "cash_secured_put", "premium_yield_call"]
 
 
