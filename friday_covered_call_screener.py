@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.07.atm-premium-v1"
+BACKEND_VERSION = "2026.07.atm-premium-below-spot-v2"
 Strategy = Literal["covered_call", "cash_secured_put", "premium_yield_call"]
 
 
@@ -372,8 +372,10 @@ def select_premium_yield_call(
     frame["PremiumUsed"] = frame.apply(
         lambda row: premium_from_quote(row, config.premium_basis), axis=1
     )
+    # For this strategy, use the nearest listed call strike at or below spot.
+    # This prevents selecting an OTM strike above the current share purchase price.
     frame["StrikeDistance_pct"] = (frame["strike"] - spot) / spot * 100.0
-    frame["AbsStrikeDistance_pct"] = frame["StrikeDistance_pct"].abs()
+    frame["DistanceBelowSpot_pct"] = (spot - frame["strike"]) / spot * 100.0
     frame["StockInvestment"] = spot * 100.0
     frame["PremiumCredit_perContract"] = frame["PremiumUsed"] * 100.0
     frame["PremiumYieldOnInvestment_pct"] = frame["PremiumUsed"] / spot * 100.0
@@ -392,7 +394,8 @@ def select_premium_yield_call(
     qualifying = frame.loc[
         (frame["strike"] > 0)
         & (frame["PremiumUsed"] > 0)
-        & (frame["AbsStrikeDistance_pct"] <= config.max_atm_strike_distance_pct)
+        & (frame["strike"] <= spot)
+        & (frame["DistanceBelowSpot_pct"] <= config.max_atm_strike_distance_pct)
         & (frame["PremiumYieldOnInvestment_pct"] >= config.min_return_pct)
         & (frame["PremiumYieldOnInvestment_pct"] <= config.max_return_pct)
         & (frame["openInterest"].fillna(0) >= config.min_open_interest)
@@ -403,21 +406,22 @@ def select_premium_yield_call(
 
     if qualifying.empty:
         return None, (
-            "No near-ATM call met strike-distance, premium-yield, liquidity, "
+            "No call at or below spot met strike-distance, premium-yield, liquidity, "
             "and spread filters"
         )
 
-    # Nearest strike first; when two strikes are equally near, prefer the higher bid,
-    # tighter spread, and higher open interest.
+    # Highest eligible strike first means the selected strike is the closest
+    # listed strike to spot without ever exceeding spot. Ties prefer higher
+    # premium yield, tighter spread, and higher open interest.
     qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
     qualifying = qualifying.sort_values(
         by=[
-            "AbsStrikeDistance_pct",
+            "strike",
             "PremiumYieldOnInvestment_pct",
             "_spread_sort",
             "openInterest",
         ],
-        ascending=[True, False, True, False],
+        ascending=[False, False, True, False],
         kind="stable",
     )
     chosen = qualifying.iloc[0]
@@ -470,7 +474,7 @@ def select_premium_yield_call(
         ),
         "InTheMoney": bool(chosen.get("inTheMoney", False)),
         "LastTradeDate": str(chosen.get("lastTradeDate", "")),
-    }, "Selected nearest-ATM call; ranked globally by premium yield"
+    }, "Selected closest listed call strike at or below spot; ranked globally by premium yield"
 
 
 def select_covered_call(
