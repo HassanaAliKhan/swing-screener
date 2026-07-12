@@ -295,7 +295,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum ATM strike distance (%)",
                 min_value=0.1,
                 max_value=20.0,
-                value=3.0,
+                value=10.0,
                 step=0.5,
                 help="The selected call strike must be at or below spot and within this percentage below spot.",
             )
