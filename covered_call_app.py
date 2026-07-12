@@ -19,7 +19,7 @@ st.set_page_config(
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
-EXPECTED_BACKEND_VERSION = "2026.07.atm-premium-below-spot-v2"
+EXPECTED_BACKEND_VERSION = "2026.07.atm-premium-cushion-profit-v3"
 if getattr(screener, "BACKEND_VERSION", None) != EXPECTED_BACKEND_VERSION:
     st.error(
         "The app and backend files are out of sync. Replace both "
@@ -63,7 +63,7 @@ def add_robinhood_review_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 def strategy_title(strategy: str) -> str:
     if strategy == "premium_yield_call":
-        return "Top ATM premium-yield covered calls"
+        return "Top ATM covered calls by cushion and max profit"
     if strategy == "cash_secured_put":
         return "Cash-secured put candidates"
     return "Deep-ITM covered-call candidates"
@@ -330,7 +330,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Maximum candidates",
                 min_value=1,
                 max_value=50,
-                value=10,
+                value=15,
                 step=1,
             )
         min_strike_discount = 0.0
@@ -609,7 +609,7 @@ if "option_income_output" in st.session_state:
 
         if displayed_strategy == "premium_yield_call":
             st.caption(
-                "Sorted by premium yield on the current 100-share investment. "
+                "Sorted first by the largest premium cushion, then by the largest maximum profit if called. "
                 "The selected contract uses the closest listed strike at or below spot within your "
                 "distance limit. Confirm the live Robinhood bid before buying shares."
             )
