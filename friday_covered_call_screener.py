@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.07.atm-premium-below-spot-v2"
+BACKEND_VERSION = "2026.07.atm-premium-cushion-profit-v3"
 Strategy = Literal["covered_call", "cash_secured_put", "premium_yield_call"]
 
 
@@ -897,6 +897,8 @@ def scan_tickers(
     elif config.strategy == "premium_yield_call":
         candidates.sort(
             key=lambda row: (
+                -safe_float(row.get("DownsideCushion_pct")),
+                -safe_float(row.get("MaxProfitIfCalled_pct")),
                 -safe_float(row.get("PremiumYieldOnInvestment_pct")),
                 safe_float(row.get("BidAskSpread_pct")),
                 -safe_float(row.get("OpenInterest")),
