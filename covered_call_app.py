@@ -19,7 +19,7 @@ st.set_page_config(
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
-EXPECTED_BACKEND_VERSION = "2026.07.atm-premium-v1"
+EXPECTED_BACKEND_VERSION = "2026.07.atm-premium-below-spot-v2"
 if getattr(screener, "BACKEND_VERSION", None) != EXPECTED_BACKEND_VERSION:
     st.error(
         "The app and backend files are out of sync. Replace both "
@@ -257,8 +257,8 @@ def candidate_column_config(strategy: str) -> dict:
 
 st.title("Option-Income Screener")
 st.caption(
-    "The default mode buys 100 shares conceptually, chooses the nearest ATM call "
-    "inside your strike-distance limit, and returns the top stocks by call premium "
+    "The default mode buys 100 shares conceptually, chooses the closest listed call "
+    "strike at or below spot inside your distance limit, and returns the top stocks by call premium "
     "as a percentage of the 100-share investment."
 )
 
@@ -297,7 +297,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 max_value=20.0,
                 value=3.0,
                 step=0.5,
-                help="The selected call strike must be within this percentage of spot.",
+                help="The selected call strike must be at or below spot and within this percentage below spot.",
             )
         with row1[1]:
             min_return = st.number_input(
@@ -600,8 +600,8 @@ if "option_income_output" in st.session_state:
         if displayed_strategy == "premium_yield_call":
             st.caption(
                 "Sorted by premium yield on the current 100-share investment. "
-                "The selected contract is the nearest strike to spot within your "
-                "ATM-distance limit. Confirm the live Robinhood bid before buying shares."
+                "The selected contract uses the closest listed strike at or below spot within your "
+                "distance limit. Confirm the live Robinhood bid before buying shares."
             )
             filename = "top_atm_premium_yield_calls.csv"
         elif displayed_strategy == "cash_secured_put":
