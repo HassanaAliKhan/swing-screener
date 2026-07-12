@@ -385,7 +385,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
             "Maximum bid-ask spread (%)",
             min_value=1.0,
             max_value=300.0,
-            value=15.0,
+            value=100.0,
             step=1.0,
         )
 
