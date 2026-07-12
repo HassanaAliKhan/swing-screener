@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.07.atm-premium-cushion-profit-v3"
+BACKEND_VERSION = "2026.07.closest-strike-first-v4"
 Strategy = Literal["covered_call", "cash_secured_put", "premium_yield_call"]
 
 
@@ -391,40 +391,45 @@ def select_premium_yield_call(
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
     )
 
-    qualifying = frame.loc[
+    # Step 1: find the closest usable listed strike at or below spot.
+    # Premium-yield thresholds must NOT push the algorithm to a much lower strike.
+    usable = frame.loc[
         (frame["strike"] > 0)
         & (frame["PremiumUsed"] > 0)
         & (frame["strike"] <= spot)
         & (frame["DistanceBelowSpot_pct"] <= config.max_atm_strike_distance_pct)
-        & (frame["PremiumYieldOnInvestment_pct"] >= config.min_return_pct)
-        & (frame["PremiumYieldOnInvestment_pct"] <= config.max_return_pct)
         & (frame["openInterest"].fillna(0) >= config.min_open_interest)
         & (frame["volume"].fillna(0) >= config.min_option_volume)
         & spread_ok
         & _regular_contract_mask(frame)
     ].copy()
 
-    if qualifying.empty:
+    if usable.empty:
         return None, (
-            "No call at or below spot met strike-distance, premium-yield, liquidity, "
-            "and spread filters"
+            "No call at or below spot met strike-distance, liquidity, and spread filters"
         )
 
-    # Highest eligible strike first means the selected strike is the closest
-    # listed strike to spot without ever exceeding spot. Ties prefer higher
-    # premium yield, tighter spread, and higher open interest.
-    qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
-    qualifying = qualifying.sort_values(
-        by=[
-            "strike",
-            "PremiumYieldOnInvestment_pct",
-            "_spread_sort",
-            "openInterest",
-        ],
-        ascending=[False, False, True, False],
+    # Highest strike <= spot is the closest listed strike without exceeding spot.
+    # Only after selecting that strike do we test its premium yield.
+    usable["_spread_sort"] = usable["BidAskSpread_pct"].fillna(float("inf"))
+    usable = usable.sort_values(
+        by=["strike", "_spread_sort", "openInterest"],
+        ascending=[False, True, False],
         kind="stable",
     )
-    chosen = qualifying.iloc[0]
+    chosen = usable.iloc[0]
+
+    chosen_yield = safe_float(chosen["PremiumYieldOnInvestment_pct"])
+    if (
+        not math.isfinite(chosen_yield)
+        or chosen_yield < config.min_return_pct
+        or chosen_yield > config.max_return_pct
+    ):
+        return None, (
+            f"Closest strike at or below spot was ${safe_float(chosen['strike']):.2f}, "
+            f"but its premium yield of {chosen_yield:.2f}% was outside the active "
+            f"{config.min_return_pct:.2f}%–{config.max_return_pct:.2f}% range"
+        )
     dte = (
         datetime.strptime(expiry, "%Y-%m-%d").date()
         - (config.today or date.today())
