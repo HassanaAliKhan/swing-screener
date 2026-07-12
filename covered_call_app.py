@@ -18,10 +18,10 @@ st.set_page_config(
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
-
 STRATEGY_LABELS = {
+    "Covered calls — maximum ATM premium yield": "premium_yield_call",
     "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
-    "Covered calls — stock already owned": "covered_call",
+    "Covered calls — deep ITM assignment return": "covered_call",
 }
 
 
@@ -39,69 +39,35 @@ def basis_value(label: str) -> str:
     }[label]
 
 
-def strategy_title(strategy: str) -> str:
-    return "Cash-secured put candidates" if strategy == "cash_secured_put" else "Covered-call candidates"
-
-
-def strategy_button_text(strategy: str) -> str:
-    return "Run cash-secured-put scan" if strategy == "cash_secured_put" else "Run covered-call scan"
-
-
 def robinhood_option_chain_url(ticker: object) -> str:
-    """Open Robinhood's option-chain page for the ticker.
-
-    This is intentionally a review link, not a prefilled order. Robinhood may
-    still require login and manual selection of expiration, strike, side, and
-    Sell/Buy action.
-    """
     symbol = quote(str(ticker).strip().upper(), safe="")
     return f"https://robinhood.com/options/chains/{symbol}"
 
 
-def option_action_note(row: pd.Series, strategy: str) -> str:
-    side = "PUT" if strategy == "cash_secured_put" else "CALL"
-    action = "SELL PUT / CSP" if strategy == "cash_secured_put" else "SELL CALL / CC"
-    expiry = str(row.get("Expiry", "")).strip()
-    strike = pd.to_numeric(pd.Series([row.get("Strike")]), errors="coerce").iloc[0]
-    bid = pd.to_numeric(pd.Series([row.get("Bid")]), errors="coerce").iloc[0]
-
-    strike_text = f"${strike:.2f}" if pd.notna(strike) else "strike?"
-    bid_text = f"bid ${bid:.2f}" if pd.notna(bid) else "bid?"
-    return f"{action}: {expiry} {strike_text} {side} | {bid_text}"
-
-
-def add_robinhood_review_columns(frame: pd.DataFrame, strategy: str) -> pd.DataFrame:
+def add_robinhood_review_columns(frame: pd.DataFrame) -> pd.DataFrame:
     result = frame.copy()
-    if result.empty or "Ticker" not in result.columns:
-        return result
-
-    result["RobinhoodChain"] = result["Ticker"].map(robinhood_option_chain_url)
-    result["OrderToFind"] = result.apply(lambda row: option_action_note(row, strategy), axis=1)
-
-    strike = pd.to_numeric(result.get("Strike"), errors="coerce")
-    premium = pd.to_numeric(result.get("PremiumUsed"), errors="coerce")
-    spot = pd.to_numeric(result.get("Spot"), errors="coerce")
-
-    if strategy == "covered_call":
-        # This is the number the user asked for: strike + premium received.
-        # If the stock is at/above this by assignment, the covered-call package
-        # is at or above breakeven/profit before fees and taxes.
-        result["StrikePlusPremium"] = strike + premium
-        result["StockMoveNeeded_pct"] = (result["StrikePlusPremium"] - spot) / spot * 100.0
-    else:
-        # CSP equivalent: effective stock basis after received premium.
-        result["EffectiveBuyPrice"] = strike - premium
-
+    if not result.empty and "Ticker" in result.columns:
+        result["RobinhoodChain"] = result["Ticker"].map(robinhood_option_chain_url)
     return result
 
 
-def candidate_columns(strategy: str) -> list[str]:
-    """Detailed table with the noisy review/debug columns hidden.
+def strategy_title(strategy: str) -> str:
+    if strategy == "premium_yield_call":
+        return "Top ATM premium-yield covered calls"
+    if strategy == "cash_secured_put":
+        return "Cash-secured put candidates"
+    return "Deep-ITM covered-call candidates"
 
-    Keep the broker link, quote fields, breakeven/profit fields, liquidity,
-    and contract symbol. Hide the long manual instruction column and the
-    columns the user said were cluttering the table.
-    """
+
+def strategy_button_text(strategy: str) -> str:
+    if strategy == "premium_yield_call":
+        return "Run ATM premium-yield scan"
+    if strategy == "cash_secured_put":
+        return "Run cash-secured-put scan"
+    return "Run deep-ITM covered-call scan"
+
+
+def candidate_columns(strategy: str) -> list[str]:
     common = [
         "Ticker",
         "RobinhoodChain",
@@ -109,47 +75,63 @@ def candidate_columns(strategy: str) -> list[str]:
         "Expiry",
         "DaysToExpiry",
         "Strike",
-        "StrikeDiscount_pct",
         "Bid",
         "Ask",
         "Mark",
-        "MarkBidGap",
-        "MarkBidGap_pct",
         "PremiumBasis",
         "PremiumUsed",
     ]
 
-    if strategy == "cash_secured_put":
+    if strategy == "premium_yield_call":
         return common + [
-            "CashCollateral_perContract",
+            "StrikeDistance_pct",
+            "StockInvestment",
             "PremiumCredit_perContract",
-            "PremiumYieldOnCollateral_pct",
-            "PremiumYieldOnSpot_pct",
-            "EffectiveBuyPrice",
-            "PutBreakeven",
-            "MaxFallBeforePutLoss_pct",
-            "EstimatedAbsPutDelta",
+            "PremiumYieldOnInvestment_pct",
+            "StrikePlusPremium",
+            "CoveredCallBreakeven",
+            "DownsideCushion_pct",
+            "MaxProfitIfCalled_pct",
+            "UnderlyingDayChange_pct",
+            "BidAskSpread_pct",
             "OpenInterest",
             "OptionVolume",
             "ImpliedVolatility_pct",
             "InTheMoney",
-            "LastTradeDate",
+            "ContractSymbol",
+        ]
+
+    if strategy == "cash_secured_put":
+        return common + [
+            "StrikeDiscount_pct",
+            "CashCollateral_perContract",
+            "PremiumCredit_perContract",
+            "PremiumYieldOnCollateral_pct",
+            "PremiumYieldOnSpot_pct",
+            "PutBreakeven",
+            "MaxFallBeforePutLoss_pct",
+            "EstimatedAbsPutDelta",
+            "BidAskSpread_pct",
+            "OpenInterest",
+            "OptionVolume",
+            "ImpliedVolatility_pct",
+            "InTheMoney",
             "ContractSymbol",
         ]
 
     return common + [
-        "StrikePlusPremium",
+        "StrikeDiscount_pct",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
         "SafetyAdjustedAssignmentProfit_pct",
         "UnderlyingDayChange_pct",
         "MaxFallBeforeCoveredCallLoss_pct",
         "CoveredCallDownsideBreakeven",
+        "BidAskSpread_pct",
         "OpenInterest",
         "OptionVolume",
         "ImpliedVolatility_pct",
         "InTheMoney",
-        "LastTradeDate",
         "ContractSymbol",
     ]
 
@@ -159,190 +141,220 @@ def candidate_column_config(strategy: str) -> dict:
         "RobinhoodChain": st.column_config.LinkColumn(
             "Robinhood chain",
             display_text="Open chain",
-            help="Opens Robinhood's option-chain page for this ticker. Manually select the exact expiration, strike, call/put side, Sell action, and limit price.",
         ),
         "Spot": st.column_config.NumberColumn("Spot", format="$%.2f"),
         "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
         "Bid": st.column_config.NumberColumn("Bid", format="$%.2f"),
         "Ask": st.column_config.NumberColumn("Ask", format="$%.2f"),
         "Mark": st.column_config.NumberColumn("Mark", format="$%.2f"),
-        "MarkBidGap": st.column_config.NumberColumn(
-            "Mark − Bid",
-            format="$%.2f",
-            help="Midpoint mark minus bid. Smaller is closer to the bid used as a conservative execution reference.",
-        ),
-        "MarkBidGap_pct": st.column_config.NumberColumn("Mark − Bid %", format="%.2f%%"),
-        "PremiumUsed": st.column_config.NumberColumn("PremiumUsed", format="$%.2f"),
-        "StrikeDiscount_pct": st.column_config.NumberColumn("StrikeDiscount_pct", format="%.2f%%"),
-        "BidAskSpread_pct": st.column_config.NumberColumn("BidAskSpread_pct", format="%.2f%%"),
-        "ImpliedVolatility_pct": st.column_config.NumberColumn("ImpliedVolatility_pct", format="%.2f%%"),
-        "OpenInterest": st.column_config.NumberColumn("OpenInterest"),
-        "OptionVolume": st.column_config.NumberColumn("OptionVolume"),
+        "PremiumUsed": st.column_config.NumberColumn("Premium used", format="$%.2f"),
+        "BidAskSpread_pct": st.column_config.NumberColumn("Spread", format="%.2f%%"),
+        "OpenInterest": st.column_config.NumberColumn("OI"),
+        "OptionVolume": st.column_config.NumberColumn("Volume"),
+        "ImpliedVolatility_pct": st.column_config.NumberColumn("IV", format="%.2f%%"),
     }
 
-    if strategy == "cash_secured_put":
+    if strategy == "premium_yield_call":
         config.update(
             {
-                "CashCollateral_perContract": st.column_config.NumberColumn(
-                    "CashCollateral_perContract",
-                    format="$%.0f",
+                "StrikeDistance_pct": st.column_config.NumberColumn(
+                    "Strike vs spot", format="%.2f%%"
+                ),
+                "StockInvestment": st.column_config.NumberColumn(
+                    "100-share investment", format="$%.0f"
                 ),
                 "PremiumCredit_perContract": st.column_config.NumberColumn(
-                    "PremiumCredit_perContract",
-                    format="$%.0f",
+                    "Premium credit", format="$%.0f"
+                ),
+                "PremiumYieldOnInvestment_pct": st.column_config.NumberColumn(
+                    "Premium yield", format="%.2f%%"
+                ),
+                "StrikePlusPremium": st.column_config.NumberColumn(
+                    "Strike + premium", format="$%.2f"
+                ),
+                "CoveredCallBreakeven": st.column_config.NumberColumn(
+                    "Stock breakeven", format="$%.2f"
+                ),
+                "DownsideCushion_pct": st.column_config.NumberColumn(
+                    "Premium cushion", format="%.2f%%"
+                ),
+                "MaxProfitIfCalled_pct": st.column_config.NumberColumn(
+                    "Max profit if called", format="%.2f%%"
+                ),
+                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
+                    "Stock day move", format="%.2f%%"
+                ),
+            }
+        )
+    elif strategy == "cash_secured_put":
+        config.update(
+            {
+                "StrikeDiscount_pct": st.column_config.NumberColumn(
+                    "Strike discount", format="%.2f%%"
+                ),
+                "CashCollateral_perContract": st.column_config.NumberColumn(
+                    "Collateral", format="$%.0f"
+                ),
+                "PremiumCredit_perContract": st.column_config.NumberColumn(
+                    "Premium credit", format="$%.0f"
                 ),
                 "PremiumYieldOnCollateral_pct": st.column_config.NumberColumn(
-                    "PremiumYieldOnCollateral_pct",
-                    format="%.2f%%",
-                    help="Premium used divided by strike collateral, before fees and taxes.",
+                    "Yield on collateral", format="%.2f%%"
                 ),
                 "PremiumYieldOnSpot_pct": st.column_config.NumberColumn(
-                    "PremiumYieldOnSpot_pct",
-                    format="%.2f%%",
-                ),
-                "EffectiveBuyPrice": st.column_config.NumberColumn(
-                    "Strike − premium",
-                    format="$%.2f",
-                    help="Same economics as PutBreakeven: strike minus premium used.",
+                    "Yield on spot", format="%.2f%%"
                 ),
                 "PutBreakeven": st.column_config.NumberColumn(
-                    "PutBreakeven",
-                    format="$%.2f",
-                    help="Effective stock basis if assigned, before fees and taxes.",
+                    "Effective buy price", format="$%.2f"
                 ),
                 "MaxFallBeforePutLoss_pct": st.column_config.NumberColumn(
-                    "MaxFallBeforePutLoss_pct",
-                    format="%.2f%%",
+                    "Fall before loss", format="%.2f%%"
                 ),
                 "EstimatedAbsPutDelta": st.column_config.NumberColumn(
-                    "EstimatedAbsPutDelta",
-                    format="%.3f",
+                    "Est. |put delta|", format="%.3f"
                 ),
             }
         )
     else:
         config.update(
             {
-                "StrikePlusPremium": st.column_config.NumberColumn(
-                    "Strike + premium",
-                    format="$%.2f",
-                    help="Strike plus premium used. Same economics as AssignmentBreakEven before fees and taxes.",
+                "StrikeDiscount_pct": st.column_config.NumberColumn(
+                    "Strike discount", format="%.2f%%"
                 ),
                 "AssignmentBreakEven": st.column_config.NumberColumn(
-                    "AssignmentBreakEven",
-                    format="$%.2f",
-                    help="Strike plus premium used; this is the final stock price needed for the covered-call package to be profitable before fees/taxes.",
+                    "Strike + premium", format="$%.2f"
                 ),
-                "AssignmentProfit_pct": st.column_config.NumberColumn("AssignmentProfit_pct", format="%.2f%%"),
+                "AssignmentProfit_pct": st.column_config.NumberColumn(
+                    "Assignment profit", format="%.2f%%"
+                ),
                 "SafetyAdjustedAssignmentProfit_pct": st.column_config.NumberColumn(
-                    "Safety-adjusted profit",
-                    format="%.2f%%",
-                    help="Yahoo assignment profit minus the live-quote safety buffer. This is the value filtered against your minimum assignment profit.",
+                    "Safety-adjusted profit", format="%.2f%%"
                 ),
                 "UnderlyingDayChange_pct": st.column_config.NumberColumn(
-                    "Stock day move",
-                    format="%.2f%%",
-                    help="Current spot versus previous close. Large same-day moves make Yahoo option bids less reliable versus Robinhood.",
+                    "Stock day move", format="%.2f%%"
                 ),
-                "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn("MaxFallBeforeCoveredCallLoss_pct", format="%.2f%%"),
-                "CoveredCallDownsideBreakeven": st.column_config.NumberColumn("CoveredCallDownsideBreakeven", format="$%.2f"),
+                "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn(
+                    "Premium cushion", format="%.2f%%"
+                ),
+                "CoveredCallDownsideBreakeven": st.column_config.NumberColumn(
+                    "Stock breakeven", format="$%.2f"
+                ),
             }
         )
 
     return config
 
+
 st.title("Option-Income Screener")
 st.caption(
-    "On-demand scan for covered calls or cash-secured puts. For each ticker, the scanner uses the furthest listed option expiry within your selected DTE cap. "
-    "The put mode ranks qualifying contracts by the largest downside buffer first."
+    "The default mode buys 100 shares conceptually, chooses the nearest ATM call "
+    "inside your strike-distance limit, and returns the top stocks by call premium "
+    "as a percentage of the 100-share investment."
 )
 
 if "option_income_watchlist_text" not in st.session_state:
     st.session_state.option_income_watchlist_text = default_watchlist()
 
-with st.expander("How the strategies work", expanded=False):
-    st.markdown(
-        """
-### Cash-secured put
-- You sell one put and reserve `strike × 100` cash in case you are assigned 100 shares.
-- **Premium yield on collateral** = `premium used / strike × 100`.
-- **Effective purchase breakeven** = `strike − premium used`.
-- **Max fall before put loss** = `(spot − (strike − premium used)) / spot × 100`.
-- A larger fall buffer and a lower estimated absolute put delta reduce risk, but neither prevents assignment or protects against a sharp decline.
-
-### Covered call
-- You own 100 shares and sell one call.
-- **Assignment profit** = `(strike + premium used − spot) / spot × 100`.
-- The premium offers only a limited downside cushion while upside is capped at the strike.
-
-The screener is for research and does not place orders. The Robinhood link opens the ticker option-chain page only; manually confirm the exact expiration, strike, call/put side, Sell action, and limit price before submitting any order. Confirm the live option chain, limit-order fill, earnings date, liquidity, and whether assignment is acceptable before trading.
-        """
-    )
-
 with st.expander("Watchlist and scan settings", expanded=True):
-    top_left, top_right = st.columns([1, 4])
-    with top_left:
+    left, right = st.columns([1, 4])
+    with left:
         if st.button("Reload saved watchlist from GitHub"):
             st.session_state.option_income_watchlist_text = default_watchlist()
             st.rerun()
-    with top_right:
-        st.caption("For permanent defaults, edit `watchlist.txt` in GitHub and commit the change.")
+    with right:
+        st.caption("For permanent defaults, edit `watchlist.txt` in GitHub.")
 
     st.text_area(
         "Watchlist",
         key="option_income_watchlist_text",
         height=220,
-        help="One ticker per line. Commas are accepted. Lines beginning with # are ignored.",
     )
 
     strategy_label = st.selectbox(
         "Strategy",
         options=list(STRATEGY_LABELS),
         index=0,
-        help="Cash-secured puts are the default because this mode prioritizes the largest fall buffer while targeting premium income.",
     )
     strategy = STRATEGY_LABELS[strategy_label]
 
     row1 = st.columns(4)
-    with row1[0]:
-        min_strike_discount = st.number_input(
-            "Minimum strike discount below spot (%)",
-            min_value=0.0,
-            max_value=95.0,
-            value=20.0,
-            step=1.0,
-            help="For a put, the strike must be at least this far below spot before premium. A 20% strike discount plus premium creates a slightly larger breakeven buffer.",
-        )
-    with row1[1]:
-        min_return = st.number_input(
-            "Minimum premium yield on collateral (%)" if strategy == "cash_secured_put" else "Minimum assignment profit (%)",
-            min_value=-50.0 if strategy == "covered_call" else 0.0,
-            max_value=100.0,
-            value=1.0,
-            step=0.25,
-        )
-    with row1[2]:
-        max_return = st.number_input(
-            "Maximum premium yield on collateral (%)" if strategy == "cash_secured_put" else "Maximum assignment profit (%)",
-            min_value=-50.0 if strategy == "covered_call" else 0.0,
-            max_value=100.0,
-            value=8.0,
-            step=0.25,
-        )
-    with row1[3]:
+
+    if strategy == "premium_yield_call":
+        with row1[0]:
+            max_atm_distance = st.number_input(
+                "Maximum ATM strike distance (%)",
+                min_value=0.1,
+                max_value=20.0,
+                value=3.0,
+                step=0.5,
+                help="The selected call strike must be within this percentage of spot.",
+            )
+        with row1[1]:
+            min_return = st.number_input(
+                "Minimum premium yield (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=0.5,
+                step=0.25,
+            )
+        with row1[2]:
+            max_return = st.number_input(
+                "Maximum premium yield (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=25.0,
+                step=0.5,
+            )
+        with row1[3]:
+            top_n = st.number_input(
+                "Maximum candidates",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+            )
+        min_strike_discount = 0.0
+    else:
+        with row1[0]:
+            min_strike_discount = st.number_input(
+                "Minimum strike discount below spot (%)",
+                min_value=0.0,
+                max_value=95.0,
+                value=20.0,
+                step=1.0,
+            )
+        with row1[1]:
+            min_return = st.number_input(
+                "Minimum return (%)",
+                min_value=-50.0 if strategy == "covered_call" else 0.0,
+                max_value=100.0,
+                value=1.0,
+                step=0.25,
+            )
+        with row1[2]:
+            max_return = st.number_input(
+                "Maximum return (%)",
+                min_value=-50.0 if strategy == "covered_call" else 0.0,
+                max_value=100.0,
+                value=8.0,
+                step=0.25,
+            )
+        with row1[3]:
+            top_n = 10
+            max_atm_distance = 3.0
+
+    row2 = st.columns(4)
+    with row2[0]:
         premium_basis_label = st.selectbox(
-            "Premium used in calculation",
+            "Premium used",
             options=[
                 "Bid — conservative / executable reference",
                 "Mark — (Bid + Ask) / 2",
                 "Last trade",
             ],
             index=0,
-            help="Bid is the conservative reference. A midpoint Mark is an estimate and may not be fillable.",
         )
-
-    row2 = st.columns(4)
-    with row2[0]:
+    with row2[1]:
         min_open_interest = st.number_input(
             "Minimum open interest",
             min_value=0,
@@ -350,7 +362,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
             value=25,
             step=5,
         )
-    with row2[1]:
+    with row2[2]:
         min_option_volume = st.number_input(
             "Minimum option volume",
             min_value=0,
@@ -358,98 +370,109 @@ with st.expander("Watchlist and scan settings", expanded=True):
             value=1,
             step=1,
         )
-    with row2[2]:
+    with row2[3]:
         max_spread = st.number_input(
             "Maximum bid-ask spread (%)",
             min_value=1.0,
             max_value=300.0,
             value=15.0,
             step=1.0,
-            help="A tighter cap avoids very illiquid contracts. The Bid setting still controls the premium calculation.",
         )
-    with row2[3]:
+
+    row3 = st.columns(4)
+    with row3[0]:
         max_expiry_days = st.number_input(
             "Maximum days to expiry",
             min_value=1,
             max_value=21,
             value=11,
             step=1,
-            help="For each ticker, selects the furthest listed option expiration that is no more than this many calendar days away.",
+        )
+    with row3[1]:
+        if strategy == "premium_yield_call":
+            premium_yield_price_cap = st.number_input(
+                "Maximum stock price ($, 0 = no cap)",
+                min_value=0.0,
+                max_value=10_000.0,
+                value=0.0,
+                step=10.0,
+            )
+        else:
+            premium_yield_price_cap = 0.0
+    with row3[2]:
+        workers = st.slider(
+            "Yahoo request concurrency",
+            min_value=1,
+            max_value=5,
+            value=3,
+        )
+    with row3[3]:
+        include_extended_spot = st.checkbox(
+            "Use premarket / after-hours spot",
+            value=False,
         )
 
-    row3 = st.columns(4)
-    with row3[0]:
-        if strategy == "cash_secured_put":
+    if strategy == "cash_secured_put":
+        row4 = st.columns(3)
+        with row4[0]:
             max_abs_put_delta = st.slider(
                 "Maximum estimated |put delta|",
                 min_value=0.05,
                 max_value=0.50,
                 value=0.15,
                 step=0.01,
-                help="Lower is more conservative. This is an IV-based delta estimate, not the probability of assignment.",
             )
-        else:
-            max_abs_put_delta = 1.0
-            cc_live_quote_safety = st.number_input(
-                "CC live-quote safety buffer (%)",
-                min_value=0.0,
-                max_value=5.0,
-                value=1.5,
-                step=0.25,
-                help=(
-                    "Yahoo/yfinance option bids can be stale versus Robinhood. "
-                    "The scanner subtracts this buffer from Yahoo assignment profit before deciding whether a covered call qualifies."
-                ),
-            )
-    with row3[1]:
-        if strategy == "cash_secured_put":
+        with row4[1]:
             max_csp_underlying_price = st.number_input(
                 "Maximum CSP underlying price ($)",
                 min_value=1.0,
                 max_value=1_000.0,
                 value=451.0,
                 step=1.0,
-                help=(
-                    "Only scan cash-secured puts on stocks at or below this price. "
-                    "This is a stock-price cap, not a broker collateral guarantee."
-                ),
             )
-            st.caption(
-                f"At a {min_strike_discount:.0f}% strike discount, a ${max_csp_underlying_price:.0f} stock implies a strike near or below "
-                f"${max_csp_underlying_price * (1 - min_strike_discount / 100):.2f}, or about "
-                f"${max_csp_underlying_price * (1 - min_strike_discount / 100) * 100:,.0f} collateral per contract before broker checks."
+        cc_live_quote_safety = 0.0
+        max_cc_day_move = 0.0
+    elif strategy == "covered_call":
+        row4 = st.columns(3)
+        with row4[0]:
+            cc_live_quote_safety = st.number_input(
+                "CC live-quote safety buffer (%)",
+                min_value=0.0,
+                max_value=5.0,
+                value=1.5,
+                step=0.25,
             )
-        else:
-            max_csp_underlying_price = None
+        with row4[1]:
             max_cc_day_move = st.number_input(
                 "Max stock day move for CC (%)",
                 min_value=0.0,
                 max_value=50.0,
                 value=5.0,
                 step=0.5,
-                help=(
-                    "Reject covered-call candidates when the underlying has moved too much today. "
-                    "Large same-day moves often make third-party option quotes stale versus Robinhood."
-                ),
             )
-    with row3[2]:
-        workers = st.slider("Yahoo request concurrency", min_value=1, max_value=5, value=3)
-    with row3[3]:
-        include_extended_spot = st.checkbox(
-            "Use premarket / after-hours stock price when Yahoo supplies it",
-            value=False,
-        )
-
-    if strategy == "cash_secured_put":
+        max_abs_put_delta = 1.0
+        max_csp_underlying_price = None
+    else:
+        max_abs_put_delta = 1.0
+        max_csp_underlying_price = None
         cc_live_quote_safety = 0.0
         max_cc_day_move = 0.0
 
-    show_debug = st.checkbox("Show all ticker diagnostics and data errors", value=True)
+    show_debug = st.checkbox(
+        "Show all ticker diagnostics and data errors",
+        value=True,
+    )
 
-run_scan = st.button(strategy_button_text(strategy), type="primary", use_container_width=True)
+run_scan = st.button(
+    strategy_button_text(strategy),
+    type="primary",
+    use_container_width=True,
+)
 
 if run_scan:
-    tickers = screener.parse_tickers(st.session_state.option_income_watchlist_text)
+    tickers = screener.parse_tickers(
+        st.session_state.option_income_watchlist_text
+    )
     if not tickers:
         st.error("Add at least one ticker to the watchlist.")
         st.stop()
@@ -474,21 +497,47 @@ if run_scan:
             if strategy == "cash_secured_put"
             else None
         ),
+        max_atm_strike_distance_pct=float(max_atm_distance),
+        max_premium_yield_stock_price=(
+            float(premium_yield_price_cap)
+            if strategy == "premium_yield_call"
+            and float(premium_yield_price_cap) > 0
+            else None
+        ),
+        top_n=int(top_n),
         max_expiry_days=int(max_expiry_days),
         include_extended_spot=include_extended_spot,
         max_workers=int(workers),
     )
 
-    progress_bar = st.progress(0, text="Starting Yahoo option-chain requests…")
+    progress_bar = st.progress(
+        0,
+        text="Starting Yahoo option-chain requests…",
+    )
     progress_text = st.empty()
 
-    def update_progress(done: int, total: int, ticker: str, status: str) -> None:
-        progress_bar.progress(done / total, text=f"{done}/{total}: {ticker} — {status}")
-        progress_text.caption("Yahoo option chains can be delayed, incomplete, or temporarily rate-limited.")
+    def update_progress(
+        done: int,
+        total: int,
+        ticker: str,
+        status: str,
+    ) -> None:
+        progress_bar.progress(
+            done / total,
+            text=f"{done}/{total}: {ticker} — {status}",
+        )
+        progress_text.caption(
+            "Yahoo option chains can be delayed or differ from Robinhood. "
+            "Confirm every candidate against Robinhood's live bid."
+        )
 
     started_at = datetime.now(timezone.utc)
     with st.spinner("Scanning option chains…"):
-        output = screener.scan_tickers(tickers, config, progress_callback=update_progress)
+        output = screener.scan_tickers(
+            tickers,
+            config,
+            progress_callback=update_progress,
+        )
     finished_at = datetime.now(timezone.utc)
 
     progress_bar.empty()
@@ -496,7 +545,9 @@ if run_scan:
 
     st.session_state.option_income_output = output
     st.session_state.option_income_scanned_at = finished_at
-    st.session_state.option_income_elapsed_seconds = (finished_at - started_at).total_seconds()
+    st.session_state.option_income_elapsed_seconds = (
+        finished_at - started_at
+    ).total_seconds()
     st.session_state.option_income_strategy = strategy
     st.session_state.option_income_show_debug = show_debug
 
@@ -509,26 +560,26 @@ if "option_income_output" in st.session_state:
     errors = pd.DataFrame(output.errors)
 
     st.caption(
-        f"Last scan completed {st.session_state.option_income_scanned_at.strftime('%Y-%m-%d %H:%M:%S UTC')} "
+        f"Last scan completed "
+        f"{st.session_state.option_income_scanned_at.strftime('%Y-%m-%d %H:%M:%S UTC')} "
         f"in {st.session_state.option_income_elapsed_seconds:.1f}s."
     )
 
     metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric(f"Potential {strategy_title(displayed_strategy).lower()}", len(candidates))
+    metric_1.metric(strategy_title(displayed_strategy), len(candidates))
     metric_2.metric("Tickers checked", len(diagnostics))
     metric_3.metric("Data errors / unavailable", len(errors))
 
-    st.subheader(
-        "Maximum-buffer qualifying cash-secured-put candidates"
-        if displayed_strategy == "cash_secured_put"
-        else "Lowest-strike qualifying covered-call candidates"
-    )
+    st.subheader(strategy_title(displayed_strategy))
 
     if candidates.empty:
         st.info("No option contracts passed every active filter in this scan.")
     else:
-        candidates_for_display = add_robinhood_review_columns(candidates, displayed_strategy)
-        visible = candidates_for_display.reindex(columns=candidate_columns(displayed_strategy)).copy()
+        display = add_robinhood_review_columns(candidates)
+        visible = display.reindex(
+            columns=candidate_columns(displayed_strategy)
+        ).copy()
+
         st.dataframe(
             visible,
             use_container_width=True,
@@ -536,23 +587,17 @@ if "option_income_output" in st.session_state:
             column_config=candidate_column_config(displayed_strategy),
         )
 
-        st.caption(
-            "Robinhood links open the ticker option-chain page, not a prefilled order. Manually match the exact expiration, strike, call/put side, Sell action, and live bid before submitting. Covered-call rows use a safety-adjusted profit filter because Yahoo bids can be stale versus Robinhood."
-        )
-
-        if displayed_strategy == "cash_secured_put":
+        if displayed_strategy == "premium_yield_call":
             st.caption(
-                "Sorted by the largest fall before an assigned put position reaches its premium-adjusted breakeven, "
-                "then lower estimated absolute put delta and tighter Mark-to-Bid gap. "
-                "Assignment can still occur, and a sharp decline can create a large loss after assignment."
+                "Sorted by premium yield on the current 100-share investment. "
+                "The selected contract is the nearest strike to spot within your "
+                "ATM-distance limit. Confirm the live Robinhood bid before buying shares."
             )
-            filename = "friday_cash_secured_put_candidates.csv"
+            filename = "top_atm_premium_yield_calls.csv"
+        elif displayed_strategy == "cash_secured_put":
+            filename = "cash_secured_put_candidates.csv"
         else:
-            st.caption(
-                "Sorted by smallest Mark-to-Bid gap percentage, then smallest dollar gap. "
-                "A smaller gap means the midpoint Mark is closer to the executable Bid."
-            )
-            filename = "friday_covered_call_candidates.csv"
+            filename = "deep_itm_covered_call_candidates.csv"
 
         st.download_button(
             "Download candidates CSV",
@@ -567,24 +612,18 @@ if "option_income_output" in st.session_state:
         if diagnostics.empty:
             st.info("No diagnostics were produced.")
         else:
-            st.dataframe(diagnostics, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download diagnostics CSV",
-                data=diagnostics.to_csv(index=False).encode("utf-8"),
-                file_name="option_income_diagnostics.csv",
-                mime="text/csv",
+            st.dataframe(
+                diagnostics,
                 use_container_width=True,
+                hide_index=True,
             )
 
         if errors.empty:
             st.success("No provider/data errors.")
         else:
             st.subheader("Data errors")
-            st.dataframe(errors, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download errors CSV",
-                data=errors.to_csv(index=False).encode("utf-8"),
-                file_name="option_income_errors.csv",
-                mime="text/csv",
+            st.dataframe(
+                errors,
                 use_container_width=True,
+                hide_index=True,
             )
