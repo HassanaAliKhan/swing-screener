@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.07.closest-strike-first-v4"
+BACKEND_VERSION = "2026.07.closest-strike-positive-profit-v5"
 Strategy = Literal["covered_call", "cash_secured_put", "premium_yield_call"]
 
 
@@ -429,6 +429,14 @@ def select_premium_yield_call(
             f"Closest strike at or below spot was ${safe_float(chosen['strike']):.2f}, "
             f"but its premium yield of {chosen_yield:.2f}% was outside the active "
             f"{config.min_return_pct:.2f}%–{config.max_return_pct:.2f}% range"
+        )
+
+    chosen_max_profit = safe_float(chosen["MaxProfitIfCalled_pct"])
+    if not math.isfinite(chosen_max_profit) or chosen_max_profit <= 0:
+        return None, (
+            f"Closest strike at or below spot was ${safe_float(chosen['strike']):.2f}, "
+            f"but strike plus premium would produce {chosen_max_profit:.2f}% "
+            "maximum profit if called. Only strictly positive called-away outcomes qualify."
         )
     dte = (
         datetime.strptime(expiry, "%Y-%m-%d").date()
