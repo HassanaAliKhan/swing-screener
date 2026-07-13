@@ -19,7 +19,7 @@ st.set_page_config(
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
-EXPECTED_BACKEND_VERSION = "2026.07.closest-strike-positive-profit-v5"
+EXPECTED_BACKEND_VERSION = "2026.07.closest-strike-first-v4"
 if getattr(screener, "BACKEND_VERSION", None) != EXPECTED_BACKEND_VERSION:
     st.error(
         "The app and backend files are out of sync. Replace both "
@@ -120,7 +120,6 @@ def candidate_columns(strategy: str) -> list[str]:
             "PremiumYieldOnSpot_pct",
             "PutBreakeven",
             "MaxFallBeforePutLoss_pct",
-            "EstimatedAbsPutDelta",
             "BidAskSpread_pct",
             "OpenInterest",
             "OptionVolume",
@@ -229,9 +228,6 @@ def candidate_column_config(strategy: str) -> dict:
                 ),
                 "MaxFallBeforePutLoss_pct": st.column_config.NumberColumn(
                     "Fall before loss", format="%.2f%%"
-                ),
-                "EstimatedAbsPutDelta": st.column_config.NumberColumn(
-                    "Est. |put delta|", format="%.3f"
                 ),
             }
         )
@@ -435,14 +431,6 @@ with st.expander("Watchlist and scan settings", expanded=True):
     if strategy == "cash_secured_put":
         row4 = st.columns(3)
         with row4[0]:
-            max_abs_put_delta = st.slider(
-                "Maximum estimated |put delta|",
-                min_value=0.05,
-                max_value=0.50,
-                value=0.15,
-                step=0.01,
-            )
-        with row4[1]:
             max_csp_underlying_price = st.number_input(
                 "Maximum CSP underlying price ($)",
                 min_value=1.0,
@@ -450,6 +438,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 value=451.0,
                 step=1.0,
             )
+        max_abs_put_delta = 1.0
         cc_live_quote_safety = 0.0
         max_cc_day_move = 0.0
     elif strategy == "covered_call":
@@ -609,14 +598,16 @@ if "option_income_output" in st.session_state:
 
         if displayed_strategy == "premium_yield_call":
             st.caption(
-                "Only contracts with strictly positive maximum profit if called are shown. "
+                "Sorted first by the largest premium cushion, then by the largest maximum profit if called. "
                 "For each ticker, the closest usable listed strike at or below spot is selected first; "
-                "the premium-yield and positive-called-profit filters are applied afterward. "
-                "Results are sorted by premium cushion, then maximum profit if called. "
-                "Confirm the live Robinhood bid before buying shares."
+                "the premium-yield filter is applied afterward. Confirm the live Robinhood bid before buying shares."
             )
             filename = "top_atm_premium_yield_calls.csv"
         elif displayed_strategy == "cash_secured_put":
+            st.caption(
+                "CSP results are ranked by the largest fall before breakeven, then higher premium yield, "
+                "tighter spread, higher open interest, and higher option volume. Delta is not used."
+            )
             filename = "cash_secured_put_candidates.csv"
         else:
             filename = "deep_itm_covered_call_candidates.csv"
