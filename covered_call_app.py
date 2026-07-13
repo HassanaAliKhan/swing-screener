@@ -19,15 +19,6 @@ st.set_page_config(
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
-EXPECTED_BACKEND_VERSION = "2026.07.closest-strike-first-v4"
-if getattr(screener, "BACKEND_VERSION", None) != EXPECTED_BACKEND_VERSION:
-    st.error(
-        "The app and backend files are out of sync. Replace both "
-        "`covered_call_app.py` and `friday_covered_call_screener.py` from the same ZIP, "
-        "then reboot the Streamlit app."
-    )
-    st.stop()
-
 STRATEGY_LABELS = {
     "Covered calls — maximum ATM premium yield": "premium_yield_call",
     "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
