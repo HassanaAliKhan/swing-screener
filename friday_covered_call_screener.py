@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.07.closest-strike-positive-profit-v5"
+BACKEND_VERSION = "2026.07.no-csp-delta-v6"
 Strategy = Literal["covered_call", "cash_secured_put", "premium_yield_call"]
 
 
@@ -642,21 +642,8 @@ def select_cash_secured_put(
     frame["MaxFallBeforePutLoss_pct"] = (
         (spot - frame["PutBreakeven"]) / spot * 100.0
     )
-    frame["EstimatedAbsPutDelta"] = frame.apply(
-        lambda row: estimated_abs_put_delta(
-            spot=spot,
-            strike=safe_float(row["strike"]),
-            implied_volatility=safe_float(row["impliedVolatility"]),
-            days_to_expiry=dte,
-        ),
-        axis=1,
-    )
-
     spread_ok = frame["BidAskSpread_pct"].isna() | (
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
-    )
-    delta_ok = frame["EstimatedAbsPutDelta"].notna() & (
-        frame["EstimatedAbsPutDelta"] <= config.max_abs_put_delta
     )
 
     qualifying = frame.loc[
@@ -665,7 +652,6 @@ def select_cash_secured_put(
         & (frame["StrikeDiscount_pct"] >= config.min_strike_discount_pct)
         & (frame["PremiumYieldOnCollateral_pct"] >= config.min_return_pct)
         & (frame["PremiumYieldOnCollateral_pct"] <= config.max_return_pct)
-        & delta_ok
         & (frame["openInterest"].fillna(0) >= config.min_open_interest)
         & (frame["volume"].fillna(0) >= config.min_option_volume)
         & spread_ok
@@ -674,8 +660,8 @@ def select_cash_secured_put(
 
     if qualifying.empty:
         return None, (
-            "No put met active downside-buffer, premium-yield, estimated-delta, "
-            "liquidity, and spread filters"
+            "No put met active downside-buffer, premium-yield, liquidity, "
+            "and spread filters"
         )
 
     qualifying["_gap_sort"] = qualifying["MarkBidGap_pct"].fillna(float("inf"))
@@ -683,13 +669,13 @@ def select_cash_secured_put(
     qualifying = qualifying.sort_values(
         by=[
             "MaxFallBeforePutLoss_pct",
-            "EstimatedAbsPutDelta",
-            "_gap_sort",
+            "PremiumYieldOnCollateral_pct",
             "_spread_sort",
             "openInterest",
+            "volume",
             "strike",
         ],
-        ascending=[False, True, True, True, False, True],
+        ascending=[False, False, True, False, False, True],
         kind="stable",
     )
     chosen = qualifying.iloc[0]
@@ -729,9 +715,6 @@ def select_cash_secured_put(
         "PutBreakeven": round_or_nan(safe_float(chosen["PutBreakeven"])),
         "MaxFallBeforePutLoss_pct": round_or_nan(
             safe_float(chosen["MaxFallBeforePutLoss_pct"])
-        ),
-        "EstimatedAbsPutDelta": round_or_nan(
-            safe_float(chosen["EstimatedAbsPutDelta"]), 3
         ),
         "BidAskSpread_pct": round_or_nan(safe_float(chosen["BidAskSpread_pct"])),
         "OptionVolume": safe_int(chosen["volume"]),
@@ -903,8 +886,10 @@ def scan_tickers(
         candidates.sort(
             key=lambda row: (
                 -safe_float(row.get("MaxFallBeforePutLoss_pct")),
-                safe_float(row.get("EstimatedAbsPutDelta")),
-                safe_float(row.get("MarkBidGap_pct")),
+                -safe_float(row.get("PremiumYieldOnCollateral_pct")),
+                safe_float(row.get("BidAskSpread_pct")),
+                -safe_float(row.get("OpenInterest")),
+                -safe_float(row.get("OptionVolume")),
             )
         )
     elif config.strategy == "premium_yield_call":
