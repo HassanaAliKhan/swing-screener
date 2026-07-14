@@ -123,8 +123,6 @@ def candidate_columns(strategy: str) -> list[str]:
         "StrikeDiscount_pct",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
-        "SafetyAdjustedAssignmentProfit_pct",
-        "UnderlyingDayChange_pct",
         "MaxFallBeforeCoveredCallLoss_pct",
         "CoveredCallDownsideBreakeven",
         "BidAskSpread_pct",
@@ -233,12 +231,6 @@ def candidate_column_config(strategy: str) -> dict:
                 ),
                 "AssignmentProfit_pct": st.column_config.NumberColumn(
                     "Assignment profit", format="%.2f%%"
-                ),
-                "SafetyAdjustedAssignmentProfit_pct": st.column_config.NumberColumn(
-                    "Safety-adjusted profit", format="%.2f%%"
-                ),
-                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
-                    "Stock day move", format="%.2f%%"
                 ),
                 "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn(
                     "Premium cushion", format="%.2f%%"
@@ -433,25 +425,10 @@ with st.expander("Watchlist and scan settings", expanded=True):
         cc_live_quote_safety = 0.0
         max_cc_day_move = 0.0
     elif strategy == "covered_call":
-        row4 = st.columns(3)
-        with row4[0]:
-            cc_live_quote_safety = st.number_input(
-                "CC live-quote safety buffer (%)",
-                min_value=0.0,
-                max_value=5.0,
-                value=1.5,
-                step=0.25,
-            )
-        with row4[1]:
-            max_cc_day_move = st.number_input(
-                "Max stock day move for CC (%)",
-                min_value=0.0,
-                max_value=50.0,
-                value=5.0,
-                step=0.5,
-            )
         max_abs_put_delta = 1.0
         max_csp_underlying_price = None
+        cc_live_quote_safety = 0.0
+        max_cc_day_move = 0.0
     else:
         max_abs_put_delta = 1.0
         max_csp_underlying_price = None
