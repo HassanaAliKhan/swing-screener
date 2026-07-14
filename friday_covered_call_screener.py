@@ -514,9 +514,6 @@ def select_covered_call(
     frame["StrikeDiscount_pct"] = (spot - frame["strike"]) / spot * 100.0
     frame["AssignmentBreakEven"] = frame["strike"] + frame["PremiumUsed"]
     frame["AssignmentProfit_pct"] = (frame["AssignmentBreakEven"] - spot) / spot * 100.0
-    frame["SafetyAdjustedAssignmentProfit_pct"] = (
-        frame["AssignmentProfit_pct"] - float(config.covered_call_live_quote_safety_pct)
-    )
     frame["UnderlyingDayChange_pct"] = underlying_day_change_pct
     frame["MaxFallBeforeCoveredCallLoss_pct"] = frame["PremiumUsed"] / spot * 100.0
     frame["CoveredCallDownsideBreakeven"] = spot - frame["PremiumUsed"]
@@ -525,23 +522,12 @@ def select_covered_call(
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
     )
     quote_sane = call_quote_sanity_mask(frame, spot, config)
-    if (
-        config.max_cc_underlying_day_change_abs_pct > 0
-        and math.isfinite(underlying_day_change_pct)
-        and abs(underlying_day_change_pct) > config.max_cc_underlying_day_change_abs_pct
-    ):
-        day_move_ok = pd.Series(False, index=frame.index)
-    else:
-        day_move_ok = pd.Series(True, index=frame.index)
-
     qualifying = frame.loc[
         (frame["strike"] > 0)
         & (frame["PremiumUsed"] > 0)
         & (frame["StrikeDiscount_pct"] >= config.min_strike_discount_pct)
         & (frame["AssignmentProfit_pct"] >= config.min_return_pct)
-        & (frame["SafetyAdjustedAssignmentProfit_pct"] >= config.min_return_pct)
         & (frame["AssignmentProfit_pct"] <= config.max_return_pct)
-        & day_move_ok
         & (frame["openInterest"].fillna(0) >= config.min_open_interest)
         & (frame["volume"].fillna(0) >= config.min_option_volume)
         & spread_ok
@@ -586,13 +572,6 @@ def select_covered_call(
         "PremiumUsed": round_or_nan(safe_float(chosen["PremiumUsed"])),
         "AssignmentBreakEven": round_or_nan(safe_float(chosen["AssignmentBreakEven"])),
         "AssignmentProfit_pct": round_or_nan(safe_float(chosen["AssignmentProfit_pct"])),
-        "SafetyAdjustedAssignmentProfit_pct": round_or_nan(
-            safe_float(chosen["SafetyAdjustedAssignmentProfit_pct"])
-        ),
-        "UnderlyingDayChange_pct": round_or_nan(underlying_day_change_pct),
-        "LiveQuoteSafetyBuffer_pct": round_or_nan(
-            float(config.covered_call_live_quote_safety_pct)
-        ),
         "MaxFallBeforeCoveredCallLoss_pct": round_or_nan(
             safe_float(chosen["MaxFallBeforeCoveredCallLoss_pct"])
         ),
