@@ -358,7 +358,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
             "Minimum open interest",
             min_value=0,
             max_value=1_000_000,
-            value=25,
+            value=5,
             step=5,
         )
     with row2[2]:
