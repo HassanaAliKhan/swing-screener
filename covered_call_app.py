@@ -373,7 +373,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
         max_spread = st.number_input(
             "Maximum bid-ask spread (%)",
             min_value=1.0,
-            max_value=100.0,
+            max_value=1000.0,
             value=500.0,
             step=1.0,
         )
