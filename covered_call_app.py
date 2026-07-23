@@ -383,7 +383,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
         max_expiry_days = st.number_input(
             "Maximum days to expiry",
             min_value=1,
-            max_value=21,
+            max_value=100,
             value=11,
             step=1,
         )
