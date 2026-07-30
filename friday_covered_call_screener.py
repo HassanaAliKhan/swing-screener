@@ -598,6 +598,7 @@ def select_cash_secured_put(
     config: ScanConfig,
     spot_source: str,
     spot_timestamp: str | None,
+    underlying_day_change_pct: float = math.nan,
 ) -> tuple[dict | None, str]:
     frame = _normalise_chain(puts)
     if frame.empty:
@@ -665,6 +666,7 @@ def select_cash_secured_put(
         "Spot": round_or_nan(spot),
         "SpotSource": spot_source,
         "SpotTimestamp": spot_timestamp or "",
+        "UnderlyingDayChange_pct": round_or_nan(underlying_day_change_pct),
         "Expiry": expiry,
         "ExpirySelection": expiry_note,
         "DaysToExpiry": dte,
@@ -764,7 +766,7 @@ def scan_one_ticker(
             if config.strategy == "cash_secured_put":
                 candidate, reason = select_cash_secured_put(
                     ticker, spot, chain.puts, expiry, expiry_note, config,
-                    spot_source, spot_timestamp
+                    spot_source, spot_timestamp, underlying_day_change
                 )
             elif config.strategy == "premium_yield_call":
                 candidate, reason = select_premium_yield_call(
