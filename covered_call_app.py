@@ -103,17 +103,22 @@ def candidate_columns(strategy: str) -> list[str]:
         ]
 
     if strategy == "cash_secured_put":
-        return common + [
+        return [
+            "Ticker",
+            "Spot",
+            "RobinhoodChain",
+            "UnderlyingDayChange_pct",
+            "Expiry",
+            "DaysToExpiry",
+            "Strike",
             "StrikeDiscount_pct",
+            "Bid",
             "CashCollateral_perContract",
             "PremiumCredit_perContract",
             "PremiumYieldOnCollateral_pct",
             "PremiumYieldOnSpot_pct",
             "PutBreakeven",
             "MaxFallBeforePutLoss_pct",
-            "BidAskSpread_pct",
-            "OpenInterest",
-            "OptionVolume",
             "ImpliedVolatility_pct",
             "InTheMoney",
             "ContractSymbol",
@@ -197,6 +202,9 @@ def candidate_column_config(strategy: str) -> dict:
     elif strategy == "cash_secured_put":
         config.update(
             {
+                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
+                    "Stock day move", format="%.2f%%"
+                ),
                 "StrikeDiscount_pct": st.column_config.NumberColumn(
                     "Strike discount", format="%.2f%%"
                 ),
