@@ -21,7 +21,7 @@ DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 STRATEGY_LABELS = {
     "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
-    "Cash-secured puts — delta <= -0.10, top yield": "csp_delta_yield",
+    "Cash-secured puts — low delta, maximum yield": "csp_delta_yield",
     "Covered calls — maximum ATM premium yield": "premium_yield_call",
     "Covered calls — deep ITM assignment return": "covered_call",
 }
@@ -59,7 +59,7 @@ def strategy_title(strategy: str) -> str:
     if strategy == "cash_secured_put":
         return "Cash-secured put candidates"
     if strategy == "csp_delta_yield":
-        return "Top 25 CSPs by collateral yield"
+        return "Top low-delta CSPs by collateral yield"
     return "Deep-ITM covered-call candidates"
 
 
@@ -281,8 +281,8 @@ def candidate_column_config(strategy: str) -> dict:
 
 st.title("Option-Income Screener")
 st.caption(
-    "Cash-secured puts are the default strategy. The delta-yield CSP mode uses bid prices, "
-    "the furthest listed expiration within the selected DTE cap, and returns the top 25 stocks "
+    "Cash-secured puts are the default strategy. The low-delta CSP mode uses Bid, "
+    "the furthest listed expiration within the selected DTE cap, and ranks qualifying stocks "
     "by premium yield on collateral."
 )
 
@@ -315,27 +315,29 @@ with st.expander("Watchlist and scan settings", expanded=True):
 
     if strategy == "csp_delta_yield":
         with row1[0]:
-            delta_threshold_abs = st.number_input(
-                "Put delta threshold",
-                min_value=0.01,
-                max_value=0.99,
-                value=0.10,
+            delta_threshold_signed = st.number_input(
+                "Minimum signed put delta",
+                min_value=-0.50,
+                max_value=-0.01,
+                value=-0.10,
                 step=0.01,
-                help="0.10 means only estimated signed put deltas <= -0.10 qualify.",
+                help=(
+                    "Only estimated put deltas greater than or equal to this value qualify. "
+                    "At the default -0.10, accepted puts have -0.10 <= delta < 0.00, "
+                    "which favors farther-OTM, lower-sensitivity puts."
+                ),
             )
         with row1[1]:
-            st.number_input(
+            top_n = st.number_input(
                 "Maximum candidates",
-                min_value=25,
-                max_value=25,
+                min_value=1,
+                max_value=100,
                 value=25,
                 step=1,
-                disabled=True,
             )
         min_strike_discount = 0.0
         min_return = 0.0
         max_return = 100.0
-        top_n = 25
         max_atm_distance = 3.0
     elif strategy == "premium_yield_call":
         with row1[0]:
@@ -372,7 +374,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 step=1,
             )
         min_strike_discount = 0.0
-        delta_threshold_abs = 1.0
+        delta_threshold_signed = -1.0
     else:
         with row1[0]:
             min_strike_discount = st.number_input(
@@ -401,7 +403,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
         with row1[3]:
             top_n = 10
             max_atm_distance = 3.0
-        delta_threshold_abs = 1.0
+        delta_threshold_signed = -1.0
 
     row2 = st.columns(4)
     with row2[0]:
@@ -492,7 +494,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 step=1.0,
             )
         max_abs_put_delta = (
-            float(delta_threshold_abs)
+            float(delta_threshold_signed)
             if strategy == "csp_delta_yield"
             else 1.0
         )
@@ -653,11 +655,12 @@ if "option_income_output" in st.session_state:
             filename = "cash_secured_put_candidates.csv"
         elif displayed_strategy == "csp_delta_yield":
             st.caption(
-                "Top 25 stocks ranked by premium yield on collateral. Uses the furthest listed expiration "
-                "within the selected DTE cap and bid as the premium standard. Only estimated signed put "
-                "deltas <= -0.10 qualify."
+                "For each ticker, the scanner first chooses the eligible put whose estimated signed delta "
+                "is closest to the threshold (default -0.10) without going below it. If tied, higher yield wins. "
+                "The final stock list is then ranked by premium yield on collateral, highest first. "
+                "Uses Bid and the furthest listed expiration within the selected DTE cap."
             )
-            filename = "top_25_csp_delta_yield.csv"
+            filename = "csp_low_delta_max_yield.csv"
         else:
             filename = "deep_itm_covered_call_candidates.csv"
 
