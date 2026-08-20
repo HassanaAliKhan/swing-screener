@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.08.csp-delta-yield-v7"
+BACKEND_VERSION = "2026.08.csp-closest-delta-then-yield-v9"
 Strategy = Literal["covered_call", "cash_secured_put", "csp_delta_yield", "premium_yield_call"]
 
 
@@ -664,13 +664,18 @@ def select_csp_delta_yield(
     spread_ok = frame["BidAskSpread_pct"].isna() | (
         frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
     )
-    delta_threshold = -abs(float(config.max_abs_put_delta))
+
+    # For this strategy, max_abs_put_delta stores the signed minimum delta threshold.
+    # Example: -0.10 means accept only low-sensitivity OTM puts with
+    # -0.10 <= delta < 0.00.
+    delta_threshold = float(config.max_abs_put_delta)
 
     qualifying = frame.loc[
         (frame["strike"] > 0)
         & (frame["PremiumUsed"] > 0)
         & frame["EstimatedPutDelta"].notna()
-        & (frame["EstimatedPutDelta"] <= delta_threshold)
+        & (frame["EstimatedPutDelta"] >= delta_threshold)
+        & (frame["EstimatedPutDelta"] < 0.0)
         & (frame["openInterest"].fillna(0) >= config.min_open_interest)
         & (frame["volume"].fillna(0) >= config.min_option_volume)
         & spread_ok
@@ -679,14 +684,28 @@ def select_csp_delta_yield(
 
     if qualifying.empty:
         return None, (
-            f"No put met signed delta <= {delta_threshold:.2f}, positive bid, "
+            f"No put met signed delta >= {delta_threshold:.2f} and < 0.00, positive bid, "
             "liquidity, and spread filters"
         )
 
+    qualifying["DeltaDistanceFromThreshold"] = (
+        qualifying["EstimatedPutDelta"] - delta_threshold
+    ).abs()
     qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
+
+    # Per ticker:
+    # 1) choose the eligible put whose delta is closest to the threshold (e.g. -0.10)
+    # 2) if effectively tied, prefer higher collateral yield
+    # 3) then tighter spread / better liquidity
     qualifying = qualifying.sort_values(
-        by=["PremiumYieldOnCollateral_pct", "_spread_sort", "openInterest", "volume"],
-        ascending=[False, True, False, False],
+        by=[
+            "DeltaDistanceFromThreshold",
+            "PremiumYieldOnCollateral_pct",
+            "_spread_sort",
+            "openInterest",
+            "volume",
+        ],
+        ascending=[True, False, True, False, False],
         kind="stable",
     )
     chosen = qualifying.iloc[0]
@@ -726,7 +745,7 @@ def select_csp_delta_yield(
             safe_float(chosen["impliedVolatility"]) * 100.0
         ),
         "InTheMoney": bool(chosen.get("inTheMoney", False)),
-    }, "Selected highest-yield put meeting signed-delta threshold using bid"
+    }, "Selected eligible put closest to the signed-delta threshold, then highest yield, using bid"
 
 
 def select_cash_secured_put(
@@ -1025,7 +1044,7 @@ def scan_tickers(
                 -safe_float(row.get("MaxFallBeforePutLoss_pct")),
             )
         )
-        candidates = candidates[:25]
+        candidates = candidates[: max(1, int(config.top_n))]
     elif config.strategy == "premium_yield_call":
         candidates.sort(
             key=lambda row: (
