@@ -20,8 +20,9 @@ DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
 
 
 STRATEGY_LABELS = {
-    "Covered calls — maximum ATM premium yield": "premium_yield_call",
     "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
+    "Cash-secured puts — delta <= -0.10, top yield": "csp_delta_yield",
+    "Covered calls — maximum ATM premium yield": "premium_yield_call",
     "Covered calls — deep ITM assignment return": "covered_call",
 }
 
@@ -57,6 +58,8 @@ def strategy_title(strategy: str) -> str:
         return "Top ATM covered calls by cushion and max profit"
     if strategy == "cash_secured_put":
         return "Cash-secured put candidates"
+    if strategy == "csp_delta_yield":
+        return "Top 25 CSPs by collateral yield"
     return "Deep-ITM covered-call candidates"
 
 
@@ -65,6 +68,8 @@ def strategy_button_text(strategy: str) -> str:
         return "Run ATM premium-yield scan"
     if strategy == "cash_secured_put":
         return "Run cash-secured-put scan"
+    if strategy == "csp_delta_yield":
+        return "Run CSP delta-yield scan"
     return "Run deep-ITM covered-call scan"
 
 
@@ -97,6 +102,28 @@ def candidate_columns(strategy: str) -> list[str]:
             "BidAskSpread_pct",
             "OpenInterest",
             "OptionVolume",
+            "ImpliedVolatility_pct",
+            "InTheMoney",
+            "ContractSymbol",
+        ]
+
+    if strategy == "csp_delta_yield":
+        return [
+            "Ticker",
+            "Spot",
+            "Strike",
+            "RobinhoodChain",
+            "UnderlyingDayChange_pct",
+            "Expiry",
+            "DaysToExpiry",
+            "StrikeDiscount_pct",
+            "Bid",
+            "CashCollateral_perContract",
+            "PremiumCredit_perContract",
+            "PremiumYieldOnCollateral_pct",
+            "PremiumYieldOnSpot_pct",
+            "PutBreakeven",
+            "MaxFallBeforePutLoss_pct",
             "ImpliedVolatility_pct",
             "InTheMoney",
             "ContractSymbol",
@@ -199,7 +226,7 @@ def candidate_column_config(strategy: str) -> dict:
                 ),
             }
         )
-    elif strategy == "cash_secured_put":
+    elif strategy in ("cash_secured_put", "csp_delta_yield"):
         config.update(
             {
                 "UnderlyingDayChange_pct": st.column_config.NumberColumn(
@@ -254,9 +281,9 @@ def candidate_column_config(strategy: str) -> dict:
 
 st.title("Option-Income Screener")
 st.caption(
-    "The default mode buys 100 shares conceptually, first chooses the closest usable listed call "
-    "strike at or below spot, and only then checks its premium yield. It returns the top stocks by call premium "
-    "as a percentage of the 100-share investment."
+    "Cash-secured puts are the default strategy. The delta-yield CSP mode uses bid prices, "
+    "the furthest listed expiration within the selected DTE cap, and returns the top 25 stocks "
+    "by premium yield on collateral."
 )
 
 if "option_income_watchlist_text" not in st.session_state:
@@ -286,7 +313,31 @@ with st.expander("Watchlist and scan settings", expanded=True):
 
     row1 = st.columns(4)
 
-    if strategy == "premium_yield_call":
+    if strategy == "csp_delta_yield":
+        with row1[0]:
+            delta_threshold_abs = st.number_input(
+                "Put delta threshold",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.10,
+                step=0.01,
+                help="0.10 means only estimated signed put deltas <= -0.10 qualify.",
+            )
+        with row1[1]:
+            st.number_input(
+                "Maximum candidates",
+                min_value=25,
+                max_value=25,
+                value=25,
+                step=1,
+                disabled=True,
+            )
+        min_strike_discount = 0.0
+        min_return = 0.0
+        max_return = 100.0
+        top_n = 25
+        max_atm_distance = 3.0
+    elif strategy == "premium_yield_call":
         with row1[0]:
             max_atm_distance = st.number_input(
                 "Maximum ATM strike distance (%)",
@@ -321,6 +372,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 step=1,
             )
         min_strike_discount = 0.0
+        delta_threshold_abs = 1.0
     else:
         with row1[0]:
             min_strike_discount = st.number_input(
@@ -349,18 +401,28 @@ with st.expander("Watchlist and scan settings", expanded=True):
         with row1[3]:
             top_n = 10
             max_atm_distance = 3.0
+        delta_threshold_abs = 1.0
 
     row2 = st.columns(4)
     with row2[0]:
-        premium_basis_label = st.selectbox(
-            "Premium used",
-            options=[
-                "Bid — conservative / executable reference",
-                "Mark — (Bid + Ask) / 2",
-                "Last trade",
-            ],
-            index=0,
-        )
+        if strategy == "csp_delta_yield":
+            premium_basis_label = "Bid — conservative / executable reference"
+            st.selectbox(
+                "Premium used",
+                options=["Bid — conservative / executable reference"],
+                index=0,
+                disabled=True,
+            )
+        else:
+            premium_basis_label = st.selectbox(
+                "Premium used",
+                options=[
+                    "Bid — conservative / executable reference",
+                    "Mark — (Bid + Ask) / 2",
+                    "Last trade",
+                ],
+                index=0,
+            )
     with row2[1]:
         min_open_interest = st.number_input(
             "Minimum open interest",
@@ -419,7 +481,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
             value=True,
         )
 
-    if strategy == "cash_secured_put":
+    if strategy in ("cash_secured_put", "csp_delta_yield"):
         row4 = st.columns(3)
         with row4[0]:
             max_csp_underlying_price = st.number_input(
@@ -429,7 +491,11 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 value=451.0,
                 step=1.0,
             )
-        max_abs_put_delta = 1.0
+        max_abs_put_delta = (
+            float(delta_threshold_abs)
+            if strategy == "csp_delta_yield"
+            else 1.0
+        )
         cc_live_quote_safety = 0.0
         max_cc_day_move = 0.0
     elif strategy == "covered_call":
@@ -479,7 +545,7 @@ if run_scan:
         max_cc_underlying_day_change_abs_pct=float(max_cc_day_move),
         max_csp_underlying_price=(
             float(max_csp_underlying_price)
-            if strategy == "cash_secured_put"
+            if strategy in ("cash_secured_put", "csp_delta_yield")
             else None
         ),
         max_atm_strike_distance_pct=float(max_atm_distance),
@@ -585,6 +651,13 @@ if "option_income_output" in st.session_state:
                 "tighter spread, higher open interest, and higher option volume. Delta is not used."
             )
             filename = "cash_secured_put_candidates.csv"
+        elif displayed_strategy == "csp_delta_yield":
+            st.caption(
+                "Top 25 stocks ranked by premium yield on collateral. Uses the furthest listed expiration "
+                "within the selected DTE cap and bid as the premium standard. Only estimated signed put "
+                "deltas <= -0.10 qualify."
+            )
+            filename = "top_25_csp_delta_yield.csv"
         else:
             filename = "deep_itm_covered_call_candidates.csv"
 
