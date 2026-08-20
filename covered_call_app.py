@@ -1,694 +1,1167 @@
+#!/usr/bin/env python3
+"""
+Option-Income Screener.
+
+Strategies:
+  * COVERED_CALL: deep-ITM / assignment-return logic.
+  * CASH_SECURED_PUT: downside-buffer logic.
+  * PREMIUM_YIELD_CALL: buy 100 shares now and sell the nearest ATM call,
+    ranking the top names by premium received as a percentage of stock cost.
+"""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import argparse
+import math
+import time
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import quote
+from typing import Callable, Iterable, Literal
 
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"^yfinance(\..*)?$")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"^yfinance(\..*)?$")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"^yfinance(\..*)?$")
+
+import numpy as np
 import pandas as pd
-import streamlit as st
 
-import friday_covered_call_screener as screener
+try:
+    import yfinance as yf
+except ImportError as exc:
+    raise SystemExit(
+        "Missing packages. Install with:\n"
+        "python -m pip install -U yfinance pandas numpy"
+    ) from exc
 
-
-st.set_page_config(
-    page_title="Option-Income Screener",
-    page_icon="💵",
-    layout="wide",
-)
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
+BACKEND_VERSION = "2026.08.csp-closest-delta-then-yield-v9"
+Strategy = Literal["covered_call", "cash_secured_put", "csp_delta_yield", "premium_yield_call"]
 
 
-STRATEGY_LABELS = {
-    "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
-    "Cash-secured puts — low delta, maximum yield": "csp_delta_yield",
-    "Covered calls — maximum ATM premium yield": "premium_yield_call",
-    "Covered calls — deep ITM assignment return": "covered_call",
-}
+@dataclass(frozen=True)
+class ScanConfig:
+    strategy: Strategy = "cash_secured_put"
+    min_strike_discount_pct: float = 20.0
+    min_return_pct: float = 1.0
+    max_return_pct: float = 8.0
+    premium_basis: str = "bid"
+    max_abs_put_delta: float = 0.15
+    min_open_interest: int = 25
+    min_option_volume: int = 1
+    max_bid_ask_spread_pct: float = 15.0
+    max_call_bid_extrinsic_pct_of_spot: float = 2.0
+    covered_call_live_quote_safety_pct: float = 1.5
+    max_cc_underlying_day_change_abs_pct: float = 5.0
+    max_csp_underlying_price: float | None = 451.0
+
+    # Premium-yield call settings.
+    max_atm_strike_distance_pct: float = 3.0
+    max_premium_yield_stock_price: float | None = None
+    top_n: int = 10
+
+    include_extended_spot: bool = False
+    max_workers: int = 3
+    retries: int = 2
+    retry_delay_seconds: float = 0.8
+    max_expiry_days: int = 11
+    today: date | None = None
 
 
-def default_watchlist() -> str:
-    if DEFAULT_WATCHLIST.exists():
-        return DEFAULT_WATCHLIST.read_text(encoding="utf-8")
-    return "# Add one ticker per line\n"
+@dataclass
+class ScanOutput:
+    candidates: list[dict]
+    diagnostics: list[dict]
+    errors: list[dict]
 
 
-def basis_value(label: str) -> str:
-    return {
-        "Bid — conservative / executable reference": "bid",
-        "Mark — (Bid + Ask) / 2": "mark",
-        "Last trade": "last",
-    }[label]
+def safe_float(value: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return math.nan
+    return number if math.isfinite(number) else math.nan
 
 
-def robinhood_option_chain_url(ticker: object) -> str:
-    symbol = quote(str(ticker).strip().upper(), safe="")
-    return f"https://robinhood.com/options/chains/{symbol}"
+def safe_int(value: object) -> int:
+    number = safe_float(value)
+    return int(number) if math.isfinite(number) else 0
 
 
-def add_robinhood_review_columns(frame: pd.DataFrame) -> pd.DataFrame:
+def round_or_nan(value: float, digits: int = 2) -> float:
+    return round(float(value), digits) if math.isfinite(value) else math.nan
+
+
+def parse_tickers(text: str) -> list[str]:
+    tickers: list[str] = []
+    seen: set[str] = set()
+
+    for raw_line in text.splitlines():
+        clean_line = raw_line.split("#", 1)[0].replace(",", " ").strip()
+        for token in clean_line.split():
+            ticker = token.upper().strip()
+            if ticker and ticker not in seen:
+                seen.add(ticker)
+                tickers.append(ticker)
+
+    return tickers
+
+
+def load_tickers(path: Path | None = None) -> list[str]:
+    selected = path or DEFAULT_WATCHLIST
+    if not selected.exists():
+        raise FileNotFoundError(
+            f"Ticker file not found: {selected}. Put watchlist.txt next to this script."
+        )
+
+    tickers = parse_tickers(selected.read_text(encoding="utf-8"))
+    if not tickers:
+        raise ValueError(f"No ticker symbols found in {selected}")
+    return tickers
+
+
+class NoEligibleExpiry(ValueError):
+    pass
+
+
+def choose_furthest_expiry_within_window(
+    expiration_strings: Iterable[str],
+    today: date | None = None,
+    max_expiry_days: int = 11,
+) -> tuple[str, str]:
+    today = today or date.today()
+    max_expiry_days = int(max_expiry_days)
+    if max_expiry_days < 1:
+        raise ValueError("max_expiry_days must be at least 1")
+
+    parsed: list[tuple[date, str]] = []
+    for raw in expiration_strings:
+        try:
+            expiry_date = datetime.strptime(str(raw), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if expiry_date >= today:
+            parsed.append((expiry_date, str(raw)))
+
+    future = sorted(parsed, key=lambda item: item[0])
+    if not future:
+        raise NoEligibleExpiry("Yahoo returned no future option expirations")
+
+    cutoff = today.fromordinal(today.toordinal() + max_expiry_days)
+    in_window = [item for item in future if item[0] <= cutoff]
+    if not in_window:
+        raise NoEligibleExpiry(
+            f"No listed option expiration within {max_expiry_days} calendar days "
+            f"(nearest Yahoo expiry: {future[0][0].isoformat()})"
+        )
+
+    chosen_date, chosen_expiry = max(in_window, key=lambda item: item[0])
+    dte = (chosen_date - today).days
+    return chosen_expiry, (
+        f"Furthest listed expiry within {max_expiry_days} calendar days ({dte} DTE)"
+    )
+
+
+def _last_non_null_close(frame: pd.DataFrame) -> tuple[float, str | None]:
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return math.nan, None
+    close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+    if close.empty:
+        return math.nan, None
+    return safe_float(close.iloc[-1]), str(close.index[-1])
+
+
+def fetch_spot(ticker_obj: yf.Ticker, include_extended: bool) -> tuple[float, str, str | None]:
+    try:
+        fast = ticker_obj.fast_info
+        for key in ("lastPrice", "last_price"):
+            value = safe_float(fast.get(key))
+            if value > 0:
+                return value, "fast_info.lastPrice", None
+    except Exception:
+        pass
+
+    for interval in ("1m", "5m"):
+        try:
+            history = ticker_obj.history(
+                period="5d",
+                interval=interval,
+                auto_adjust=False,
+                prepost=include_extended,
+                raise_errors=False,
+            )
+            value, timestamp = _last_non_null_close(history)
+            if value > 0:
+                return value, f"history {interval} close", timestamp
+        except Exception:
+            pass
+
+    raise ValueError("Unable to obtain a valid underlying price from Yahoo")
+
+
+def fetch_previous_close(ticker_obj: yf.Ticker) -> float:
+    try:
+        fast = ticker_obj.fast_info
+        for key in ("previousClose", "previous_close", "regularMarketPreviousClose"):
+            value = safe_float(fast.get(key))
+            if value > 0:
+                return value
+    except Exception:
+        pass
+
+    try:
+        history = ticker_obj.history(
+            period="10d",
+            interval="1d",
+            auto_adjust=False,
+            prepost=False,
+            raise_errors=False,
+        )
+        close = pd.to_numeric(history.get("Close"), errors="coerce").dropna()
+        if len(close) >= 2:
+            return safe_float(close.iloc[-2])
+        if len(close) == 1:
+            return safe_float(close.iloc[-1])
+    except Exception:
+        pass
+
+    return math.nan
+
+
+def day_change_pct(spot: float, previous_close: float) -> float:
+    if not math.isfinite(spot) or not math.isfinite(previous_close) or previous_close <= 0:
+        return math.nan
+    return (spot - previous_close) / previous_close * 100.0
+
+
+def quote_mark(bid: float, ask: float) -> float:
+    if bid > 0 and ask >= bid:
+        return (bid + ask) / 2.0
+    return math.nan
+
+
+def premium_from_quote(row: pd.Series, basis: str) -> float:
+    bid = safe_float(row.get("bid"))
+    ask = safe_float(row.get("ask"))
+    last = safe_float(row.get("lastPrice"))
+    mark = quote_mark(bid, ask)
+
+    if basis == "mark":
+        return mark
+    if basis == "bid":
+        return bid if bid > 0 else math.nan
+    if basis == "last":
+        return last if last > 0 else math.nan
+    raise ValueError(f"Unsupported premium basis: {basis}")
+
+
+def bid_ask_spread_pct(bid: float, ask: float) -> float:
+    mark = quote_mark(bid, ask)
+    if not math.isfinite(mark) or mark <= 0:
+        return math.nan
+    return (ask - bid) / mark * 100.0
+
+
+def call_quote_sanity_mask(frame: pd.DataFrame, spot: float, config: ScanConfig) -> pd.Series:
+    if frame.empty:
+        return pd.Series(False, index=frame.index)
+
+    max_extrinsic = max(
+        0.25,
+        spot * float(config.max_call_bid_extrinsic_pct_of_spot) / 100.0,
+    )
+    intrinsic = np.maximum(spot - frame["strike"], 0.0)
+    bid_extrinsic = frame["bid"] - intrinsic
+    return bid_extrinsic.isna() | (bid_extrinsic <= max_extrinsic)
+
+
+def normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def estimated_abs_put_delta(
+    spot: float,
+    strike: float,
+    implied_volatility: float,
+    days_to_expiry: int,
+) -> float:
+    if (
+        not math.isfinite(spot)
+        or not math.isfinite(strike)
+        or not math.isfinite(implied_volatility)
+        or spot <= 0
+        or strike <= 0
+        or implied_volatility <= 0
+    ):
+        return math.nan
+
+    years = max(float(days_to_expiry), 1.0) / 365.0
+    sigma_sqrt_t = implied_volatility * math.sqrt(years)
+    if sigma_sqrt_t <= 0:
+        return math.nan
+
+    d1 = (math.log(spot / strike) + 0.5 * implied_volatility**2 * years) / sigma_sqrt_t
+    return abs(normal_cdf(d1) - 1.0)
+
+
+
+def estimated_put_delta(
+    spot: float,
+    strike: float,
+    implied_volatility: float,
+    days_to_expiry: int,
+) -> float:
+    """Approximate signed Black-Scholes put delta using Yahoo implied volatility."""
+    if (
+        not math.isfinite(spot)
+        or not math.isfinite(strike)
+        or not math.isfinite(implied_volatility)
+        or spot <= 0
+        or strike <= 0
+        or implied_volatility <= 0
+    ):
+        return math.nan
+
+    years = max(float(days_to_expiry), 1.0) / 365.0
+    sigma_sqrt_t = implied_volatility * math.sqrt(years)
+    if sigma_sqrt_t <= 0:
+        return math.nan
+
+    d1 = (math.log(spot / strike) + 0.5 * implied_volatility**2 * years) / sigma_sqrt_t
+    return normal_cdf(d1) - 1.0
+
+def _regular_contract_mask(frame: pd.DataFrame) -> pd.Series:
+    if "contractSize" not in frame.columns:
+        return pd.Series(True, index=frame.index)
+    return frame["contractSize"].fillna("REGULAR").astype(str).eq("REGULAR")
+
+
+def _normalise_chain(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
     result = frame.copy()
-    if not result.empty and "Ticker" in result.columns:
-        result["RobinhoodChain"] = result["Ticker"].map(robinhood_option_chain_url)
+    required = [
+        "strike",
+        "bid",
+        "ask",
+        "lastPrice",
+        "volume",
+        "openInterest",
+        "impliedVolatility",
+    ]
+    for column in required:
+        if column not in result.columns:
+            result[column] = np.nan
+        result[column] = pd.to_numeric(result[column], errors="coerce")
+
+    result["Mark"] = result.apply(
+        lambda row: quote_mark(safe_float(row["bid"]), safe_float(row["ask"])),
+        axis=1,
+    )
+    result["BidAskSpread_pct"] = result.apply(
+        lambda row: bid_ask_spread_pct(safe_float(row["bid"]), safe_float(row["ask"])),
+        axis=1,
+    )
+    result["MarkBidGap"] = result["Mark"] - result["bid"]
+    result["MarkBidGap_pct"] = np.where(
+        result["Mark"] > 0,
+        result["MarkBidGap"] / result["Mark"] * 100.0,
+        np.nan,
+    )
     return result
 
 
-def strategy_title(strategy: str) -> str:
-    if strategy == "premium_yield_call":
-        return "Top ATM covered calls by cushion and max profit"
-    if strategy == "cash_secured_put":
-        return "Cash-secured put candidates"
-    if strategy == "csp_delta_yield":
-        return "Top low-delta CSPs by collateral yield"
-    return "Deep-ITM covered-call candidates"
+def select_premium_yield_call(
+    ticker: str,
+    spot: float,
+    calls: pd.DataFrame,
+    expiry: str,
+    expiry_note: str,
+    config: ScanConfig,
+    spot_source: str,
+    spot_timestamp: str | None,
+    underlying_day_change_pct: float = math.nan,
+) -> tuple[dict | None, str]:
+    """Select the nearest-ATM qualifying call and calculate premium yield.
+
+    One candidate is returned per ticker. Global top-N ranking happens after all
+    tickers finish.
+    """
+    frame = _normalise_chain(calls)
+    if frame.empty:
+        return None, "Yahoo returned an empty call chain"
+
+    frame["PremiumUsed"] = frame.apply(
+        lambda row: premium_from_quote(row, config.premium_basis), axis=1
+    )
+    # For this strategy, use the nearest listed call strike at or below spot.
+    # This prevents selecting an OTM strike above the current share purchase price.
+    frame["StrikeDistance_pct"] = (frame["strike"] - spot) / spot * 100.0
+    frame["DistanceBelowSpot_pct"] = (spot - frame["strike"]) / spot * 100.0
+    frame["StockInvestment"] = spot * 100.0
+    frame["PremiumCredit_perContract"] = frame["PremiumUsed"] * 100.0
+    frame["PremiumYieldOnInvestment_pct"] = frame["PremiumUsed"] / spot * 100.0
+    frame["StrikePlusPremium"] = frame["strike"] + frame["PremiumUsed"]
+    frame["CoveredCallBreakeven"] = spot - frame["PremiumUsed"]
+    frame["DownsideCushion_pct"] = frame["PremiumUsed"] / spot * 100.0
+    frame["MaxProfitIfCalled_pct"] = (
+        (frame["strike"] + frame["PremiumUsed"] - spot) / spot * 100.0
+    )
+    frame["UnderlyingDayChange_pct"] = underlying_day_change_pct
+
+    spread_ok = frame["BidAskSpread_pct"].notna() & (
+        frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
+    )
+
+    # Step 1: find the closest usable listed strike at or below spot.
+    # Premium-yield thresholds must NOT push the algorithm to a much lower strike.
+    usable = frame.loc[
+        (frame["strike"] > 0)
+        & (frame["PremiumUsed"] > 0)
+        & (frame["strike"] <= spot)
+        & (frame["DistanceBelowSpot_pct"] <= config.max_atm_strike_distance_pct)
+        & (frame["openInterest"].fillna(0) >= config.min_open_interest)
+        & (frame["volume"].fillna(0) >= config.min_option_volume)
+        & spread_ok
+        & _regular_contract_mask(frame)
+    ].copy()
+
+    if usable.empty:
+        return None, (
+            "No call at or below spot met strike-distance, liquidity, and spread filters"
+        )
+
+    # Highest strike <= spot is the closest listed strike without exceeding spot.
+    # Only after selecting that strike do we test its premium yield.
+    usable["_spread_sort"] = usable["BidAskSpread_pct"].fillna(float("inf"))
+    usable = usable.sort_values(
+        by=["strike", "_spread_sort", "openInterest"],
+        ascending=[False, True, False],
+        kind="stable",
+    )
+    chosen = usable.iloc[0]
+
+    chosen_yield = safe_float(chosen["PremiumYieldOnInvestment_pct"])
+    if (
+        not math.isfinite(chosen_yield)
+        or chosen_yield < config.min_return_pct
+        or chosen_yield > config.max_return_pct
+    ):
+        return None, (
+            f"Closest strike at or below spot was ${safe_float(chosen['strike']):.2f}, "
+            f"but its premium yield of {chosen_yield:.2f}% was outside the active "
+            f"{config.min_return_pct:.2f}%–{config.max_return_pct:.2f}% range"
+        )
+
+    chosen_max_profit = safe_float(chosen["MaxProfitIfCalled_pct"])
+    if not math.isfinite(chosen_max_profit) or chosen_max_profit <= 0:
+        return None, (
+            f"Closest strike at or below spot was ${safe_float(chosen['strike']):.2f}, "
+            f"but strike plus premium would produce {chosen_max_profit:.2f}% "
+            "maximum profit if called. Only strictly positive called-away outcomes qualify."
+        )
+    dte = (
+        datetime.strptime(expiry, "%Y-%m-%d").date()
+        - (config.today or date.today())
+    ).days
+
+    return {
+        "Strategy": "PREMIUM_YIELD_CALL",
+        "Ticker": ticker,
+        "Spot": round_or_nan(spot),
+        "SpotSource": spot_source,
+        "SpotTimestamp": spot_timestamp or "",
+        "Expiry": expiry,
+        "ExpirySelection": expiry_note,
+        "DaysToExpiry": dte,
+        "ContractSymbol": str(chosen.get("contractSymbol", "")),
+        "Strike": round_or_nan(safe_float(chosen["strike"])),
+        "StrikeDistance_pct": round_or_nan(safe_float(chosen["StrikeDistance_pct"])),
+        "Bid": round_or_nan(safe_float(chosen["bid"])),
+        "Ask": round_or_nan(safe_float(chosen["ask"])),
+        "Mark": round_or_nan(safe_float(chosen["Mark"])),
+        "Last": round_or_nan(safe_float(chosen["lastPrice"])),
+        "PremiumBasis": config.premium_basis,
+        "PremiumUsed": round_or_nan(safe_float(chosen["PremiumUsed"])),
+        "StockInvestment": round_or_nan(safe_float(chosen["StockInvestment"])),
+        "PremiumCredit_perContract": round_or_nan(
+            safe_float(chosen["PremiumCredit_perContract"])
+        ),
+        "PremiumYieldOnInvestment_pct": round_or_nan(
+            safe_float(chosen["PremiumYieldOnInvestment_pct"])
+        ),
+        "StrikePlusPremium": round_or_nan(safe_float(chosen["StrikePlusPremium"])),
+        "CoveredCallBreakeven": round_or_nan(
+            safe_float(chosen["CoveredCallBreakeven"])
+        ),
+        "DownsideCushion_pct": round_or_nan(
+            safe_float(chosen["DownsideCushion_pct"])
+        ),
+        "MaxProfitIfCalled_pct": round_or_nan(
+            safe_float(chosen["MaxProfitIfCalled_pct"])
+        ),
+        "UnderlyingDayChange_pct": round_or_nan(underlying_day_change_pct),
+        "BidAskSpread_pct": round_or_nan(safe_float(chosen["BidAskSpread_pct"])),
+        "OptionVolume": safe_int(chosen["volume"]),
+        "OpenInterest": safe_int(chosen["openInterest"]),
+        "ImpliedVolatility_pct": round_or_nan(
+            safe_float(chosen["impliedVolatility"]) * 100.0
+        ),
+        "InTheMoney": bool(chosen.get("inTheMoney", False)),
+        "LastTradeDate": str(chosen.get("lastTradeDate", "")),
+    }, "Selected closest listed call strike at or below spot; ranked globally by premium yield"
 
 
-def strategy_button_text(strategy: str) -> str:
-    if strategy == "premium_yield_call":
-        return "Run ATM premium-yield scan"
-    if strategy == "cash_secured_put":
-        return "Run cash-secured-put scan"
-    if strategy == "csp_delta_yield":
-        return "Run CSP delta-yield scan"
-    return "Run deep-ITM covered-call scan"
+def select_covered_call(
+    ticker: str,
+    spot: float,
+    calls: pd.DataFrame,
+    expiry: str,
+    expiry_note: str,
+    config: ScanConfig,
+    spot_source: str,
+    spot_timestamp: str | None,
+    underlying_day_change_pct: float = math.nan,
+) -> tuple[dict | None, str]:
+    frame = _normalise_chain(calls)
+    if frame.empty:
+        return None, "Yahoo returned an empty call chain"
+
+    frame["PremiumUsed"] = frame.apply(
+        lambda row: premium_from_quote(row, config.premium_basis), axis=1
+    )
+    frame["CallIntrinsic"] = np.maximum(spot - frame["strike"], 0.0)
+    frame["BidExtrinsic"] = frame["bid"] - frame["CallIntrinsic"]
+    frame["MarkExtrinsic"] = frame["Mark"] - frame["CallIntrinsic"]
+    frame["StrikeDiscount_pct"] = (spot - frame["strike"]) / spot * 100.0
+    frame["AssignmentBreakEven"] = frame["strike"] + frame["PremiumUsed"]
+    frame["AssignmentProfit_pct"] = (frame["AssignmentBreakEven"] - spot) / spot * 100.0
+    frame["UnderlyingDayChange_pct"] = underlying_day_change_pct
+    frame["MaxFallBeforeCoveredCallLoss_pct"] = frame["PremiumUsed"] / spot * 100.0
+    frame["CoveredCallDownsideBreakeven"] = spot - frame["PremiumUsed"]
+
+    spread_ok = frame["BidAskSpread_pct"].isna() | (
+        frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
+    )
+    quote_sane = call_quote_sanity_mask(frame, spot, config)
+    qualifying = frame.loc[
+        (frame["strike"] > 0)
+        & (frame["PremiumUsed"] > 0)
+        & (frame["StrikeDiscount_pct"] >= config.min_strike_discount_pct)
+        & (frame["AssignmentProfit_pct"] >= config.min_return_pct)
+        & (frame["AssignmentProfit_pct"] <= config.max_return_pct)
+        & (frame["openInterest"].fillna(0) >= config.min_open_interest)
+        & (frame["volume"].fillna(0) >= config.min_option_volume)
+        & spread_ok
+        & quote_sane
+        & _regular_contract_mask(frame)
+    ].copy()
+
+    if qualifying.empty:
+        return None, "No call met active strike, return, liquidity, spread, and quote-sanity filters"
+
+    qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
+    qualifying = qualifying.sort_values(
+        by=["strike", "AssignmentProfit_pct", "PremiumUsed", "_spread_sort"],
+        ascending=[True, False, False, True],
+        kind="stable",
+    )
+    chosen = qualifying.iloc[0]
+    dte = (
+        datetime.strptime(expiry, "%Y-%m-%d").date()
+        - (config.today or date.today())
+    ).days
+
+    return {
+        "Strategy": "COVERED_CALL_REVIEW",
+        "Ticker": ticker,
+        "Spot": round_or_nan(spot),
+        "SpotSource": spot_source,
+        "SpotTimestamp": spot_timestamp or "",
+        "Expiry": expiry,
+        "ExpirySelection": expiry_note,
+        "DaysToExpiry": dte,
+        "ContractSymbol": str(chosen.get("contractSymbol", "")),
+        "Strike": round_or_nan(safe_float(chosen["strike"])),
+        "StrikeDiscount_pct": round_or_nan(safe_float(chosen["StrikeDiscount_pct"])),
+        "Bid": round_or_nan(safe_float(chosen["bid"])),
+        "Ask": round_or_nan(safe_float(chosen["ask"])),
+        "Mark": round_or_nan(safe_float(chosen["Mark"])),
+        "MarkBidGap": round_or_nan(safe_float(chosen["MarkBidGap"])),
+        "MarkBidGap_pct": round_or_nan(safe_float(chosen["MarkBidGap_pct"])),
+        "Last": round_or_nan(safe_float(chosen["lastPrice"])),
+        "PremiumBasis": config.premium_basis,
+        "PremiumUsed": round_or_nan(safe_float(chosen["PremiumUsed"])),
+        "AssignmentBreakEven": round_or_nan(safe_float(chosen["AssignmentBreakEven"])),
+        "AssignmentProfit_pct": round_or_nan(safe_float(chosen["AssignmentProfit_pct"])),
+        "MaxFallBeforeCoveredCallLoss_pct": round_or_nan(
+            safe_float(chosen["MaxFallBeforeCoveredCallLoss_pct"])
+        ),
+        "CoveredCallDownsideBreakeven": round_or_nan(
+            safe_float(chosen["CoveredCallDownsideBreakeven"])
+        ),
+        "BidAskSpread_pct": round_or_nan(safe_float(chosen["BidAskSpread_pct"])),
+        "OptionVolume": safe_int(chosen["volume"]),
+        "OpenInterest": safe_int(chosen["openInterest"]),
+        "ImpliedVolatility_pct": round_or_nan(
+            safe_float(chosen["impliedVolatility"]) * 100.0
+        ),
+        "InTheMoney": bool(chosen.get("inTheMoney", False)),
+        "LastTradeDate": str(chosen.get("lastTradeDate", "")),
+    }, "Selected lowest qualifying covered-call strike"
 
 
-def candidate_columns(strategy: str) -> list[str]:
-    common = [
-        "Ticker",
-        "Spot",
-        "RobinhoodChain",
-        "Expiry",
-        "DaysToExpiry",
-        "Strike",
-        "Bid",
-        "Ask",
-        "Mark",
-        "PremiumBasis",
-        "PremiumUsed",
-    ]
 
-    if strategy == "premium_yield_call":
-        return common + [
-            "StrikeDistance_pct",
-            "StockInvestment",
-            "PremiumCredit_perContract",
-            "PremiumYieldOnInvestment_pct",
-            "StrikePlusPremium",
-            "CoveredCallBreakeven",
-            "DownsideCushion_pct",
-            "MaxProfitIfCalled_pct",
-            "UnderlyingDayChange_pct",
-            "BidAskSpread_pct",
-            "OpenInterest",
-            "OptionVolume",
-            "ImpliedVolatility_pct",
-            "InTheMoney",
-            "ContractSymbol",
-        ]
+def select_csp_delta_yield(
+    ticker: str,
+    spot: float,
+    puts: pd.DataFrame,
+    expiry: str,
+    expiry_note: str,
+    config: ScanConfig,
+    spot_source: str,
+    spot_timestamp: str | None,
+    underlying_day_change_pct: float = math.nan,
+) -> tuple[dict | None, str]:
+    """Pick the highest collateral-yield put meeting the signed-delta threshold."""
+    frame = _normalise_chain(puts)
+    if frame.empty:
+        return None, "Yahoo returned an empty put chain"
 
-    if strategy == "csp_delta_yield":
-        return [
-            "Ticker",
-            "Spot",
-            "Strike",
-            "RobinhoodChain",
-            "UnderlyingDayChange_pct",
-            "Expiry",
-            "DaysToExpiry",
-            "StrikeDiscount_pct",
-            "Bid",
-            "CashCollateral_perContract",
-            "PremiumCredit_perContract",
+    dte = (
+        datetime.strptime(expiry, "%Y-%m-%d").date()
+        - (config.today or date.today())
+    ).days
+
+    # Bid is always the standard for this strategy, regardless of generic UI basis.
+    frame["PremiumUsed"] = pd.to_numeric(frame["bid"], errors="coerce")
+
+    frame["StrikeDiscount_pct"] = (spot - frame["strike"]) / spot * 100.0
+    frame["CashCollateral_perContract"] = frame["strike"] * 100.0
+    frame["PremiumCredit_perContract"] = frame["PremiumUsed"] * 100.0
+    frame["PremiumYieldOnCollateral_pct"] = (
+        frame["PremiumUsed"] / frame["strike"] * 100.0
+    )
+    frame["PremiumYieldOnSpot_pct"] = frame["PremiumUsed"] / spot * 100.0
+    frame["PutBreakeven"] = frame["strike"] - frame["PremiumUsed"]
+    frame["MaxFallBeforePutLoss_pct"] = (
+        (spot - frame["PutBreakeven"]) / spot * 100.0
+    )
+    frame["EstimatedPutDelta"] = frame.apply(
+        lambda row: estimated_put_delta(
+            spot=spot,
+            strike=safe_float(row["strike"]),
+            implied_volatility=safe_float(row["impliedVolatility"]),
+            days_to_expiry=dte,
+        ),
+        axis=1,
+    )
+
+    spread_ok = frame["BidAskSpread_pct"].isna() | (
+        frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
+    )
+
+    # For this strategy, max_abs_put_delta stores the signed minimum delta threshold.
+    # Example: -0.10 means accept only low-sensitivity OTM puts with
+    # -0.10 <= delta < 0.00.
+    delta_threshold = float(config.max_abs_put_delta)
+
+    qualifying = frame.loc[
+        (frame["strike"] > 0)
+        & (frame["PremiumUsed"] > 0)
+        & frame["EstimatedPutDelta"].notna()
+        & (frame["EstimatedPutDelta"] >= delta_threshold)
+        & (frame["EstimatedPutDelta"] < 0.0)
+        & (frame["openInterest"].fillna(0) >= config.min_open_interest)
+        & (frame["volume"].fillna(0) >= config.min_option_volume)
+        & spread_ok
+        & _regular_contract_mask(frame)
+    ].copy()
+
+    if qualifying.empty:
+        return None, (
+            f"No put met signed delta >= {delta_threshold:.2f} and < 0.00, positive bid, "
+            "liquidity, and spread filters"
+        )
+
+    qualifying["DeltaDistanceFromThreshold"] = (
+        qualifying["EstimatedPutDelta"] - delta_threshold
+    ).abs()
+    qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
+
+    # Per ticker:
+    # 1) choose the eligible put whose delta is closest to the threshold (e.g. -0.10)
+    # 2) if effectively tied, prefer higher collateral yield
+    # 3) then tighter spread / better liquidity
+    qualifying = qualifying.sort_values(
+        by=[
+            "DeltaDistanceFromThreshold",
             "PremiumYieldOnCollateral_pct",
-            "PremiumYieldOnSpot_pct",
-            "PutBreakeven",
-            "MaxFallBeforePutLoss_pct",
-            "ImpliedVolatility_pct",
-            "InTheMoney",
-            "ContractSymbol",
-        ]
+            "_spread_sort",
+            "openInterest",
+            "volume",
+        ],
+        ascending=[True, False, True, False, False],
+        kind="stable",
+    )
+    chosen = qualifying.iloc[0]
 
-    if strategy == "cash_secured_put":
-        return [
-            "Ticker",
-            "Spot",
-            "RobinhoodChain",
-            "UnderlyingDayChange_pct",
-            "Expiry",
-            "DaysToExpiry",
-            "Strike",
-            "StrikeDiscount_pct",
-            "Bid",
-            "CashCollateral_perContract",
-            "PremiumCredit_perContract",
+    return {
+        "Strategy": "CSP_DELTA_YIELD",
+        "Ticker": ticker,
+        "Spot": round_or_nan(spot),
+        "SpotSource": spot_source,
+        "SpotTimestamp": spot_timestamp or "",
+        "UnderlyingDayChange_pct": round_or_nan(underlying_day_change_pct),
+        "Expiry": expiry,
+        "ExpirySelection": expiry_note,
+        "DaysToExpiry": dte,
+        "ContractSymbol": str(chosen.get("contractSymbol", "")),
+        "Strike": round_or_nan(safe_float(chosen["strike"])),
+        "StrikeDiscount_pct": round_or_nan(safe_float(chosen["StrikeDiscount_pct"])),
+        "Bid": round_or_nan(safe_float(chosen["bid"])),
+        "CashCollateral_perContract": round_or_nan(
+            safe_float(chosen["CashCollateral_perContract"])
+        ),
+        "PremiumCredit_perContract": round_or_nan(
+            safe_float(chosen["PremiumCredit_perContract"])
+        ),
+        "PremiumYieldOnCollateral_pct": round_or_nan(
+            safe_float(chosen["PremiumYieldOnCollateral_pct"])
+        ),
+        "PremiumYieldOnSpot_pct": round_or_nan(
+            safe_float(chosen["PremiumYieldOnSpot_pct"])
+        ),
+        "PutBreakeven": round_or_nan(safe_float(chosen["PutBreakeven"])),
+        "MaxFallBeforePutLoss_pct": round_or_nan(
+            safe_float(chosen["MaxFallBeforePutLoss_pct"])
+        ),
+        "EstimatedPutDelta": round_or_nan(safe_float(chosen["EstimatedPutDelta"]), 3),
+        "ImpliedVolatility_pct": round_or_nan(
+            safe_float(chosen["impliedVolatility"]) * 100.0
+        ),
+        "InTheMoney": bool(chosen.get("inTheMoney", False)),
+    }, "Selected eligible put closest to the signed-delta threshold, then highest yield, using bid"
+
+
+def select_cash_secured_put(
+    ticker: str,
+    spot: float,
+    puts: pd.DataFrame,
+    expiry: str,
+    expiry_note: str,
+    config: ScanConfig,
+    spot_source: str,
+    spot_timestamp: str | None,
+    underlying_day_change_pct: float = math.nan,
+) -> tuple[dict | None, str]:
+    frame = _normalise_chain(puts)
+    if frame.empty:
+        return None, "Yahoo returned an empty put chain"
+
+    dte = (
+        datetime.strptime(expiry, "%Y-%m-%d").date()
+        - (config.today or date.today())
+    ).days
+    frame["PremiumUsed"] = frame.apply(
+        lambda row: premium_from_quote(row, config.premium_basis), axis=1
+    )
+    frame["StrikeDiscount_pct"] = (spot - frame["strike"]) / spot * 100.0
+    frame["CashCollateral_perContract"] = frame["strike"] * 100.0
+    frame["PremiumCredit_perContract"] = frame["PremiumUsed"] * 100.0
+    frame["PremiumYieldOnCollateral_pct"] = (
+        frame["PremiumUsed"] / frame["strike"] * 100.0
+    )
+    frame["PremiumYieldOnSpot_pct"] = frame["PremiumUsed"] / spot * 100.0
+    frame["PutBreakeven"] = frame["strike"] - frame["PremiumUsed"]
+    frame["MaxFallBeforePutLoss_pct"] = (
+        (spot - frame["PutBreakeven"]) / spot * 100.0
+    )
+    spread_ok = frame["BidAskSpread_pct"].isna() | (
+        frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
+    )
+
+    qualifying = frame.loc[
+        (frame["strike"] > 0)
+        & (frame["PremiumUsed"] > 0)
+        & (frame["StrikeDiscount_pct"] >= config.min_strike_discount_pct)
+        & (frame["PremiumYieldOnCollateral_pct"] >= config.min_return_pct)
+        & (frame["PremiumYieldOnCollateral_pct"] <= config.max_return_pct)
+        & (frame["openInterest"].fillna(0) >= config.min_open_interest)
+        & (frame["volume"].fillna(0) >= config.min_option_volume)
+        & spread_ok
+        & _regular_contract_mask(frame)
+    ].copy()
+
+    if qualifying.empty:
+        return None, (
+            "No put met active downside-buffer, premium-yield, liquidity, "
+            "and spread filters"
+        )
+
+    qualifying["_gap_sort"] = qualifying["MarkBidGap_pct"].fillna(float("inf"))
+    qualifying["_spread_sort"] = qualifying["BidAskSpread_pct"].fillna(float("inf"))
+    qualifying = qualifying.sort_values(
+        by=[
+            "MaxFallBeforePutLoss_pct",
             "PremiumYieldOnCollateral_pct",
-            "PremiumYieldOnSpot_pct",
-            "PutBreakeven",
-            "MaxFallBeforePutLoss_pct",
-            "ImpliedVolatility_pct",
-            "InTheMoney",
-            "ContractSymbol",
-        ]
+            "_spread_sort",
+            "openInterest",
+            "volume",
+            "strike",
+        ],
+        ascending=[False, False, True, False, False, True],
+        kind="stable",
+    )
+    chosen = qualifying.iloc[0]
 
-    return common + [
-        "StrikeDiscount_pct",
-        "AssignmentBreakEven",
-        "AssignmentProfit_pct",
-        "MaxFallBeforeCoveredCallLoss_pct",
-        "CoveredCallDownsideBreakeven",
-        "BidAskSpread_pct",
-        "OpenInterest",
-        "OptionVolume",
-        "ImpliedVolatility_pct",
-        "InTheMoney",
-        "ContractSymbol",
-    ]
-
-
-def candidate_column_config(strategy: str) -> dict:
-    config = {
-        "Ticker": st.column_config.TextColumn(
-            "Ticker",
-            pinned=True,
-            width="small",
+    return {
+        "Strategy": "CASH_SECURED_PUT_REVIEW",
+        "Ticker": ticker,
+        "Spot": round_or_nan(spot),
+        "SpotSource": spot_source,
+        "SpotTimestamp": spot_timestamp or "",
+        "UnderlyingDayChange_pct": round_or_nan(underlying_day_change_pct),
+        "Expiry": expiry,
+        "ExpirySelection": expiry_note,
+        "DaysToExpiry": dte,
+        "ContractSymbol": str(chosen.get("contractSymbol", "")),
+        "Strike": round_or_nan(safe_float(chosen["strike"])),
+        "StrikeDiscount_pct": round_or_nan(safe_float(chosen["StrikeDiscount_pct"])),
+        "Bid": round_or_nan(safe_float(chosen["bid"])),
+        "Ask": round_or_nan(safe_float(chosen["ask"])),
+        "Mark": round_or_nan(safe_float(chosen["Mark"])),
+        "MarkBidGap": round_or_nan(safe_float(chosen["MarkBidGap"])),
+        "MarkBidGap_pct": round_or_nan(safe_float(chosen["MarkBidGap_pct"])),
+        "Last": round_or_nan(safe_float(chosen["lastPrice"])),
+        "PremiumBasis": config.premium_basis,
+        "PremiumUsed": round_or_nan(safe_float(chosen["PremiumUsed"])),
+        "CashCollateral_perContract": round_or_nan(
+            safe_float(chosen["CashCollateral_perContract"])
         ),
-        "Spot": st.column_config.NumberColumn(
-            "Spot",
-            format="$%.2f",
-            pinned=True,
-            width="small",
+        "PremiumCredit_perContract": round_or_nan(
+            safe_float(chosen["PremiumCredit_perContract"])
         ),
-        "RobinhoodChain": st.column_config.LinkColumn(
-            "Robinhood chain",
-            display_text="Open chain",
+        "PremiumYieldOnCollateral_pct": round_or_nan(
+            safe_float(chosen["PremiumYieldOnCollateral_pct"])
         ),
-        "Strike": st.column_config.NumberColumn("Strike", format="$%.2f", pinned=True,  width="small"),
-        "Bid": st.column_config.NumberColumn("Bid", format="$%.2f"),
-        "Ask": st.column_config.NumberColumn("Ask", format="$%.2f"),
-        "Mark": st.column_config.NumberColumn("Mark", format="$%.2f"),
-        "PremiumUsed": st.column_config.NumberColumn("Premium used", format="$%.2f"),
-        "BidAskSpread_pct": st.column_config.NumberColumn("Spread", format="%.2f%%"),
-        "OpenInterest": st.column_config.NumberColumn("OI"),
-        "OptionVolume": st.column_config.NumberColumn("Volume"),
-        "ImpliedVolatility_pct": st.column_config.NumberColumn("IV", format="%.2f%%"),
-    }
+        "PremiumYieldOnSpot_pct": round_or_nan(
+            safe_float(chosen["PremiumYieldOnSpot_pct"])
+        ),
+        "PutBreakeven": round_or_nan(safe_float(chosen["PutBreakeven"])),
+        "MaxFallBeforePutLoss_pct": round_or_nan(
+            safe_float(chosen["MaxFallBeforePutLoss_pct"])
+        ),
+        "BidAskSpread_pct": round_or_nan(safe_float(chosen["BidAskSpread_pct"])),
+        "OptionVolume": safe_int(chosen["volume"]),
+        "OpenInterest": safe_int(chosen["openInterest"]),
+        "ImpliedVolatility_pct": round_or_nan(
+            safe_float(chosen["impliedVolatility"]) * 100.0
+        ),
+        "InTheMoney": bool(chosen.get("inTheMoney", False)),
+        "LastTradeDate": str(chosen.get("lastTradeDate", "")),
+    }, "Selected maximum-buffer qualifying cash-secured put"
 
-    if strategy == "premium_yield_call":
-        config.update(
-            {
-                "StrikeDistance_pct": st.column_config.NumberColumn(
-                    "Strike vs spot", format="%.2f%%"
-                ),
-                "StockInvestment": st.column_config.NumberColumn(
-                    "100-share investment", format="$%.0f"
-                ),
-                "PremiumCredit_perContract": st.column_config.NumberColumn(
-                    "Premium credit", format="$%.0f"
-                ),
-                "PremiumYieldOnInvestment_pct": st.column_config.NumberColumn(
-                    "Premium yield", format="%.2f%%"
-                ),
-                "StrikePlusPremium": st.column_config.NumberColumn(
-                    "Strike + premium", format="$%.2f"
-                ),
-                "CoveredCallBreakeven": st.column_config.NumberColumn(
-                    "Stock breakeven", format="$%.2f"
-                ),
-                "DownsideCushion_pct": st.column_config.NumberColumn(
-                    "Premium cushion", format="%.2f%%"
-                ),
-                "MaxProfitIfCalled_pct": st.column_config.NumberColumn(
-                    "Max profit if called", format="%.2f%%"
-                ),
-                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
-                    "Stock day move", format="%.2f%%"
-                ),
+
+def scan_one_ticker(
+    ticker: str,
+    config: ScanConfig,
+) -> tuple[dict | None, dict, dict | None]:
+    for attempt in range(1, max(1, config.retries) + 1):
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            spot, spot_source, spot_timestamp = fetch_spot(
+                ticker_obj,
+                config.include_extended_spot,
+            )
+            previous_close = fetch_previous_close(ticker_obj)
+            underlying_day_change = day_change_pct(spot, previous_close)
+
+            if (
+                config.strategy in ("cash_secured_put", "csp_delta_yield")
+                and config.max_csp_underlying_price is not None
+                and spot > config.max_csp_underlying_price
+            ):
+                diagnostic = {
+                    "Ticker": ticker,
+                    "Strategy": config.strategy,
+                    "Spot": round_or_nan(spot),
+                    "Result": "SPOT_ABOVE_CSP_CAP",
+                    "Reason": (
+                        f"Spot ${spot:.2f} exceeds CSP cap "
+                        f"${config.max_csp_underlying_price:.2f}"
+                    ),
+                }
+                return None, diagnostic, None
+
+            if (
+                config.strategy == "premium_yield_call"
+                and config.max_premium_yield_stock_price is not None
+                and spot > config.max_premium_yield_stock_price
+            ):
+                diagnostic = {
+                    "Ticker": ticker,
+                    "Strategy": config.strategy,
+                    "Spot": round_or_nan(spot),
+                    "Result": "SPOT_ABOVE_PREMIUM_YIELD_CAP",
+                    "Reason": (
+                        f"Spot ${spot:.2f} exceeds premium-yield stock-price cap "
+                        f"${config.max_premium_yield_stock_price:.2f}"
+                    ),
+                }
+                return None, diagnostic, None
+
+            expiry, expiry_note = choose_furthest_expiry_within_window(
+                ticker_obj.options,
+                today=config.today,
+                max_expiry_days=config.max_expiry_days,
+            )
+            chain = ticker_obj.option_chain(expiry)
+
+            if config.strategy == "cash_secured_put":
+                candidate, reason = select_cash_secured_put(
+                    ticker, spot, chain.puts, expiry, expiry_note, config,
+                    spot_source, spot_timestamp, underlying_day_change
+                )
+            elif config.strategy == "csp_delta_yield":
+                candidate, reason = select_csp_delta_yield(
+                    ticker, spot, chain.puts, expiry, expiry_note, config,
+                    spot_source, spot_timestamp, underlying_day_change
+                )
+            elif config.strategy == "premium_yield_call":
+                candidate, reason = select_premium_yield_call(
+                    ticker, spot, chain.calls, expiry, expiry_note, config,
+                    spot_source, spot_timestamp, underlying_day_change
+                )
+            else:
+                candidate, reason = select_covered_call(
+                    ticker, spot, chain.calls, expiry, expiry_note, config,
+                    spot_source, spot_timestamp, underlying_day_change
+                )
+
+            diagnostic = {
+                "Ticker": ticker,
+                "Strategy": config.strategy,
+                "Spot": round_or_nan(spot),
+                "Expiry": expiry,
+                "ExpirySelection": expiry_note,
+                "PremiumBasis": config.premium_basis,
+                "MaxExpiryDays": config.max_expiry_days,
+                "UnderlyingDayChange_pct": round_or_nan(underlying_day_change),
+                "Result": "QUALIFIED" if candidate is not None else "NO_MATCH",
+                "Reason": reason,
             }
-        )
-    elif strategy in ("cash_secured_put", "csp_delta_yield"):
-        config.update(
-            {
-                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
-                    "Stock day move", format="%.2f%%"
-                ),
-                "StrikeDiscount_pct": st.column_config.NumberColumn(
-                    "Strike discount", format="%.2f%%"
-                ),
-                "CashCollateral_perContract": st.column_config.NumberColumn(
-                    "Collateral", format="$%.0f"
-                ),
-                "PremiumCredit_perContract": st.column_config.NumberColumn(
-                    "Premium credit", format="$%.0f"
-                ),
-                "PremiumYieldOnCollateral_pct": st.column_config.NumberColumn(
-                    "Yield on collateral", format="%.2f%%"
-                ),
-                "PremiumYieldOnSpot_pct": st.column_config.NumberColumn(
-                    "Yield on spot", format="%.2f%%"
-                ),
-                "PutBreakeven": st.column_config.NumberColumn(
-                    "Effective buy price", format="$%.2f"
-                ),
-                "MaxFallBeforePutLoss_pct": st.column_config.NumberColumn(
-                    "Fall before loss", format="%.2f%%"
-                ),
+            return candidate, diagnostic, None
+
+        except NoEligibleExpiry as exc:
+            diagnostic = {
+                "Ticker": ticker,
+                "Strategy": config.strategy,
+                "Spot": math.nan,
+                "Result": "NO_EXPIRY_WINDOW",
+                "Reason": str(exc),
             }
-        )
-    else:
-        config.update(
-            {
-                "StrikeDiscount_pct": st.column_config.NumberColumn(
-                    "Strike discount", format="%.2f%%"
-                ),
-                "AssignmentBreakEven": st.column_config.NumberColumn(
-                    "Strike + premium", format="$%.2f"
-                ),
-                "AssignmentProfit_pct": st.column_config.NumberColumn(
-                    "Assignment profit", format="%.2f%%"
-                ),
-                "MaxFallBeforeCoveredCallLoss_pct": st.column_config.NumberColumn(
-                    "Premium cushion", format="%.2f%%"
-                ),
-                "CoveredCallDownsideBreakeven": st.column_config.NumberColumn(
-                    "Stock breakeven", format="$%.2f"
-                ),
-            }
-        )
+            return None, diagnostic, None
 
-    return config
+        except Exception as exc:
+            if attempt >= max(1, config.retries):
+                error = {"Ticker": ticker, "Error": f"{type(exc).__name__}: {exc}"}
+                diagnostic = {
+                    "Ticker": ticker,
+                    "Strategy": config.strategy,
+                    "Spot": math.nan,
+                    "Result": "ERROR",
+                    "Reason": error["Error"],
+                }
+                return None, diagnostic, error
+            time.sleep(max(0.0, config.retry_delay_seconds))
+
+    raise RuntimeError("Unreachable retry state")
 
 
-st.title("Option-Income Screener")
-st.caption(
-    "Cash-secured puts are the default strategy. The low-delta CSP mode uses Bid, "
-    "the furthest listed expiration within the selected DTE cap, and ranks qualifying stocks "
-    "by premium yield on collateral."
-)
+def scan_tickers(
+    tickers: list[str],
+    config: ScanConfig,
+    progress_callback: Callable[[int, int, str, str], None] | None = None,
+) -> ScanOutput:
+    candidates: list[dict] = []
+    diagnostics: list[dict] = []
+    errors: list[dict] = []
 
-if "option_income_watchlist_text" not in st.session_state:
-    st.session_state.option_income_watchlist_text = default_watchlist()
-
-with st.expander("Watchlist and scan settings", expanded=True):
-    left, right = st.columns([1, 4])
-    with left:
-        if st.button("Reload saved watchlist from GitHub"):
-            st.session_state.option_income_watchlist_text = default_watchlist()
-            st.rerun()
-    with right:
-        st.caption("For permanent defaults, edit `watchlist.txt` in GitHub.")
-
-    st.text_area(
-        "Watchlist",
-        key="option_income_watchlist_text",
-        height=220,
-    )
-
-    strategy_label = st.selectbox(
-        "Strategy",
-        options=list(STRATEGY_LABELS),
-        index=0,
-    )
-    strategy = STRATEGY_LABELS[strategy_label]
-
-    row1 = st.columns(4)
-
-    if strategy == "csp_delta_yield":
-        with row1[0]:
-            delta_threshold_signed = st.number_input(
-                "Minimum signed put delta",
-                min_value=-0.50,
-                max_value=-0.01,
-                value=-0.10,
-                step=0.01,
-                help=(
-                    "Only estimated put deltas greater than or equal to this value qualify. "
-                    "At the default -0.10, accepted puts have -0.10 <= delta < 0.00, "
-                    "which favors farther-OTM, lower-sensitivity puts."
-                ),
-            )
-        with row1[1]:
-            top_n = st.number_input(
-                "Maximum candidates",
-                min_value=1,
-                max_value=100,
-                value=25,
-                step=1,
-            )
-        min_strike_discount = 0.0
-        min_return = 0.0
-        max_return = 100.0
-        max_atm_distance = 3.0
-    elif strategy == "premium_yield_call":
-        with row1[0]:
-            max_atm_distance = st.number_input(
-                "Maximum ATM strike distance (%)",
-                min_value=0.1,
-                max_value=20.0,
-                value=15.0,
-                step=0.5,
-                help="The selected call strike must be at or below spot and within this percentage below spot.",
-            )
-        with row1[1]:
-            min_return = st.number_input(
-                "Minimum premium yield (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=4.5,
-                step=0.25,
-            )
-        with row1[2]:
-            max_return = st.number_input(
-                "Maximum premium yield (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=50.0,
-                step=0.5,
-            )
-        with row1[3]:
-            top_n = st.number_input(
-                "Maximum candidates",
-                min_value=1,
-                max_value=50,
-                value=15,
-                step=1,
-            )
-        min_strike_discount = 0.0
-        delta_threshold_signed = -1.0
-    else:
-        with row1[0]:
-            min_strike_discount = st.number_input(
-                "Minimum strike discount below spot (%)",
-                min_value=0.0,
-                max_value=95.0,
-                value=20.0,
-                step=1.0,
-            )
-        with row1[1]:
-            min_return = st.number_input(
-                "Minimum return (%)",
-                min_value=-50.0 if strategy == "covered_call" else 0.0,
-                max_value=100.0,
-                value=1.0,
-                step=0.25,
-            )
-        with row1[2]:
-            max_return = st.number_input(
-                "Maximum return (%)",
-                min_value=-50.0 if strategy == "covered_call" else 0.0,
-                max_value=100.0,
-                value=8.0,
-                step=0.25,
-            )
-        with row1[3]:
-            top_n = 10
-            max_atm_distance = 3.0
-        delta_threshold_signed = -1.0
-
-    row2 = st.columns(4)
-    with row2[0]:
-        if strategy == "csp_delta_yield":
-            premium_basis_label = "Bid — conservative / executable reference"
-            st.selectbox(
-                "Premium used",
-                options=["Bid — conservative / executable reference"],
-                index=0,
-                disabled=True,
-            )
-        else:
-            premium_basis_label = st.selectbox(
-                "Premium used",
-                options=[
-                    "Bid — conservative / executable reference",
-                    "Mark — (Bid + Ask) / 2",
-                    "Last trade",
-                ],
-                index=0,
-            )
-    with row2[1]:
-        min_open_interest = st.number_input(
-            "Minimum open interest",
-            min_value=0,
-            max_value=1_000_000,
-            value=5,
-            step=5,
-        )
-    with row2[2]:
-        min_option_volume = st.number_input(
-            "Minimum option volume",
-            min_value=0,
-            max_value=1_000_000,
-            value=1,
-            step=1,
-        )
-    with row2[3]:
-        max_spread = st.number_input(
-            "Maximum bid-ask spread (%)",
-            min_value=1.0,
-            max_value=1000.0,
-            value=500.0,
-            step=1.0,
-        )
-
-    row3 = st.columns(4)
-    with row3[0]:
-        max_expiry_days = st.number_input(
-            "Maximum days to expiry",
-            min_value=1,
-            max_value=100,
-            value=11,
-            step=1,
-        )
-    with row3[1]:
-        if strategy == "premium_yield_call":
-            premium_yield_price_cap = st.number_input(
-                "Maximum stock price ($, 0 = no cap)",
-                min_value=0.0,
-                max_value=10_000.0,
-                value=750.0,
-                step=10.0,
-            )
-        else:
-            premium_yield_price_cap = 0.0
-    with row3[2]:
-        workers = st.slider(
-            "Yahoo request concurrency",
-            min_value=1,
-            max_value=5,
-            value=3,
-        )
-    with row3[3]:
-        include_extended_spot = st.checkbox(
-            "Use premarket / after-hours spot",
-            value=True,
-        )
-
-    if strategy in ("cash_secured_put", "csp_delta_yield"):
-        row4 = st.columns(3)
-        with row4[0]:
-            max_csp_underlying_price = st.number_input(
-                "Maximum CSP underlying price ($)",
-                min_value=1.0,
-                max_value=1_000.0,
-                value=451.0,
-                step=1.0,
-            )
-        max_abs_put_delta = (
-            float(delta_threshold_signed)
-            if strategy == "csp_delta_yield"
-            else 1.0
-        )
-        cc_live_quote_safety = 0.0
-        max_cc_day_move = 0.0
-    elif strategy == "covered_call":
-        max_abs_put_delta = 1.0
-        max_csp_underlying_price = None
-        cc_live_quote_safety = 0.0
-        max_cc_day_move = 0.0
-    else:
-        max_abs_put_delta = 1.0
-        max_csp_underlying_price = None
-        cc_live_quote_safety = 0.0
-        max_cc_day_move = 0.0
-
-    show_debug = st.checkbox(
-        "Show all ticker diagnostics and data errors",
-        value=True,
-    )
-
-run_scan = st.button(
-    strategy_button_text(strategy),
-    type="primary",
-    use_container_width=True,
-)
-
-if run_scan:
-    tickers = screener.parse_tickers(
-        st.session_state.option_income_watchlist_text
-    )
     if not tickers:
-        st.error("Add at least one ticker to the watchlist.")
-        st.stop()
-    if min_return > max_return:
-        st.error("Minimum return cannot exceed maximum return.")
-        st.stop()
+        return ScanOutput(candidates, diagnostics, errors)
 
-    config = screener.ScanConfig(
-        strategy=strategy,
-        min_strike_discount_pct=float(min_strike_discount),
-        min_return_pct=float(min_return),
-        max_return_pct=float(max_return),
-        premium_basis=basis_value(premium_basis_label),
-        max_abs_put_delta=float(max_abs_put_delta),
-        min_open_interest=int(min_open_interest),
-        min_option_volume=int(min_option_volume),
-        max_bid_ask_spread_pct=float(max_spread),
-        covered_call_live_quote_safety_pct=float(cc_live_quote_safety),
-        max_cc_underlying_day_change_abs_pct=float(max_cc_day_move),
-        max_csp_underlying_price=(
-            float(max_csp_underlying_price)
-            if strategy in ("cash_secured_put", "csp_delta_yield")
-            else None
-        ),
-        max_atm_strike_distance_pct=float(max_atm_distance),
-        max_premium_yield_stock_price=(
-            float(premium_yield_price_cap)
-            if strategy == "premium_yield_call"
-            and float(premium_yield_price_cap) > 0
-            else None
-        ),
-        top_n=int(top_n),
-        max_expiry_days=int(max_expiry_days),
-        include_extended_spot=include_extended_spot,
-        max_workers=int(workers),
-    )
+    workers = max(1, min(int(config.max_workers), 8))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(scan_one_ticker, ticker, config): ticker
+            for ticker in tickers
+        }
 
-    progress_bar = st.progress(
-        0,
-        text="Starting Yahoo option-chain requests…",
-    )
-    progress_text = st.empty()
+        for completed, future in enumerate(as_completed(futures), start=1):
+            ticker = futures[future]
+            try:
+                candidate, diagnostic, error = future.result()
+            except Exception as exc:
+                candidate = None
+                diagnostic = {
+                    "Ticker": ticker,
+                    "Strategy": config.strategy,
+                    "Spot": math.nan,
+                    "Result": "ERROR",
+                    "Reason": f"Worker error: {type(exc).__name__}: {exc}",
+                }
+                error = {"Ticker": ticker, "Error": diagnostic["Reason"]}
 
-    def update_progress(
-        done: int,
-        total: int,
-        ticker: str,
-        status: str,
-    ) -> None:
-        progress_bar.progress(
-            done / total,
-            text=f"{done}/{total}: {ticker} — {status}",
+            diagnostics.append(diagnostic)
+            if candidate is not None:
+                candidates.append(candidate)
+            if error is not None:
+                errors.append(error)
+            if progress_callback is not None:
+                progress_callback(
+                    completed, len(tickers), ticker, diagnostic["Result"]
+                )
+
+    if config.strategy == "cash_secured_put":
+        candidates.sort(
+            key=lambda row: (
+                -safe_float(row.get("MaxFallBeforePutLoss_pct")),
+                -safe_float(row.get("PremiumYieldOnCollateral_pct")),
+                safe_float(row.get("BidAskSpread_pct")),
+                -safe_float(row.get("OpenInterest")),
+                -safe_float(row.get("OptionVolume")),
+            )
         )
-        progress_text.caption(
-            "Yahoo option chains can be delayed or differ from Robinhood. "
-            "Confirm every candidate against Robinhood's live bid."
+    elif config.strategy == "csp_delta_yield":
+        candidates.sort(
+            key=lambda row: (
+                -safe_float(row.get("PremiumYieldOnCollateral_pct")),
+                -safe_float(row.get("MaxFallBeforePutLoss_pct")),
+            )
         )
-
-    started_at = datetime.now(timezone.utc)
-    with st.spinner("Scanning option chains…"):
-        output = screener.scan_tickers(
-            tickers,
-            config,
-            progress_callback=update_progress,
+        candidates = candidates[: max(1, int(config.top_n))]
+    elif config.strategy == "premium_yield_call":
+        candidates.sort(
+            key=lambda row: (
+                -safe_float(row.get("DownsideCushion_pct")),
+                -safe_float(row.get("MaxProfitIfCalled_pct")),
+                -safe_float(row.get("PremiumYieldOnInvestment_pct")),
+                safe_float(row.get("BidAskSpread_pct")),
+                -safe_float(row.get("OpenInterest")),
+            )
         )
-    finished_at = datetime.now(timezone.utc)
-
-    progress_bar.empty()
-    progress_text.empty()
-
-    st.session_state.option_income_output = output
-    st.session_state.option_income_scanned_at = finished_at
-    st.session_state.option_income_elapsed_seconds = (
-        finished_at - started_at
-    ).total_seconds()
-    st.session_state.option_income_strategy = strategy
-    st.session_state.option_income_show_debug = show_debug
-
-
-if "option_income_output" in st.session_state:
-    output: screener.ScanOutput = st.session_state.option_income_output
-    displayed_strategy: str = st.session_state.option_income_strategy
-    candidates = pd.DataFrame(output.candidates)
-    diagnostics = pd.DataFrame(output.diagnostics)
-    errors = pd.DataFrame(output.errors)
-
-    st.caption(
-        f"Last scan completed "
-        f"{st.session_state.option_income_scanned_at.strftime('%Y-%m-%d %H:%M:%S UTC')} "
-        f"in {st.session_state.option_income_elapsed_seconds:.1f}s."
-    )
-
-    metric_1, metric_2, metric_3 = st.columns(3)
-    metric_1.metric(strategy_title(displayed_strategy), len(candidates))
-    metric_2.metric("Tickers checked", len(diagnostics))
-    metric_3.metric("Data errors / unavailable", len(errors))
-
-    st.subheader(strategy_title(displayed_strategy))
-
-    if candidates.empty:
-        st.info("No option contracts passed every active filter in this scan.")
+        candidates = candidates[: max(1, int(config.top_n))]
     else:
-        display = add_robinhood_review_columns(candidates)
-        visible = display.reindex(
-            columns=candidate_columns(displayed_strategy)
-        ).copy()
-
-        st.dataframe(
-            visible,
-            use_container_width=True,
-            hide_index=True,
-            column_config=candidate_column_config(displayed_strategy),
+        candidates.sort(
+            key=lambda row: (
+                safe_float(row.get("MarkBidGap_pct")),
+                safe_float(row.get("MarkBidGap")),
+                -safe_float(row.get("MaxFallBeforeCoveredCallLoss_pct")),
+            )
         )
 
-        if displayed_strategy == "premium_yield_call":
-            st.caption(
-                "Sorted first by the largest premium cushion, then by the largest maximum profit if called. "
-                "For each ticker, the closest usable listed strike at or below spot is selected first; "
-                "the premium-yield filter is applied afterward. Confirm the live Robinhood bid before buying shares."
-            )
-            filename = "top_atm_premium_yield_calls.csv"
-        elif displayed_strategy == "cash_secured_put":
-            st.caption(
-                "CSP results are ranked by the largest fall before breakeven, then higher premium yield, "
-                "tighter spread, higher open interest, and higher option volume. Delta is not used."
-            )
-            filename = "cash_secured_put_candidates.csv"
-        elif displayed_strategy == "csp_delta_yield":
-            st.caption(
-                "For each ticker, the scanner first chooses the eligible put whose estimated signed delta "
-                "is closest to the threshold (default -0.10) without going below it. If tied, higher yield wins. "
-                "The final stock list is then ranked by premium yield on collateral, highest first. "
-                "Uses Bid and the furthest listed expiration within the selected DTE cap."
-            )
-            filename = "csp_low_delta_max_yield.csv"
-        else:
-            filename = "deep_itm_covered_call_candidates.csv"
+    diagnostics.sort(key=lambda row: row["Ticker"])
+    errors.sort(key=lambda row: row["Ticker"])
+    return ScanOutput(candidates, diagnostics, errors)
 
-        st.download_button(
-            "Download candidates CSV",
-            data=visible.to_csv(index=False).encode("utf-8"),
-            file_name=filename,
-            mime="text/csv",
-            use_container_width=True,
-        )
 
-    if st.session_state.option_income_show_debug:
-        st.subheader("All ticker diagnostics")
-        if diagnostics.empty:
-            st.info("No diagnostics were produced.")
-        else:
-            st.dataframe(
-                diagnostics,
-                use_container_width=True,
-                hide_index=True,
-            )
+def write_csv(rows: list[dict], path: Path, columns: list[str] | None = None) -> None:
+    frame = pd.DataFrame(rows)
+    if columns is not None:
+        frame = frame.reindex(columns=columns)
+    frame.to_csv(path, index=False)
 
-        if errors.empty:
-            st.success("No provider/data errors.")
-        else:
-            st.subheader("Data errors")
-            st.dataframe(
-                errors,
-                use_container_width=True,
-                hide_index=True,
-            )
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Screen covered calls, premium-yield calls, or cash-secured puts.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--tickers-file", type=Path, default=None)
+    parser.add_argument("--outdir", type=Path, default=Path("output"))
+    parser.add_argument(
+        "--strategy",
+        choices=["covered_call", "cash_secured_put", "csp_delta_yield", "premium_yield_call"],
+        default="premium_yield_call",
+    )
+    parser.add_argument("--min-strike-discount-pct", type=float, default=20.0)
+    parser.add_argument("--min-return-pct", type=float, default=0.5)
+    parser.add_argument("--max-return-pct", type=float, default=25.0)
+    parser.add_argument("--premium-basis", choices=["mark", "bid", "last"], default="bid")
+    parser.add_argument("--max-abs-put-delta", type=float, default=0.15)
+    parser.add_argument("--min-open-interest", type=int, default=25)
+    parser.add_argument("--min-option-volume", type=int, default=1)
+    parser.add_argument("--max-bid-ask-spread-pct", type=float, default=15.0)
+    parser.add_argument("--max-call-bid-extrinsic-pct-of-spot", type=float, default=2.0)
+    parser.add_argument("--covered-call-live-quote-safety-pct", type=float, default=1.5)
+    parser.add_argument("--max-cc-underlying-day-change-abs-pct", type=float, default=5.0)
+    parser.add_argument("--max-csp-underlying-price", type=float, default=451.0)
+    parser.add_argument("--max-atm-strike-distance-pct", type=float, default=3.0)
+    parser.add_argument("--max-premium-yield-stock-price", type=float, default=0.0)
+    parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument("--max-expiry-days", type=int, default=11)
+    parser.add_argument("--include-extended-spot", action="store_true")
+    parser.add_argument("--max-workers", type=int, default=3)
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--debug", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.min_return_pct > args.max_return_pct:
+        raise SystemExit("Minimum return cannot exceed maximum return.")
+
+    tickers = load_tickers(args.tickers_file)
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    config = ScanConfig(
+        strategy=args.strategy,
+        min_strike_discount_pct=args.min_strike_discount_pct,
+        min_return_pct=args.min_return_pct,
+        max_return_pct=args.max_return_pct,
+        premium_basis=args.premium_basis,
+        max_abs_put_delta=args.max_abs_put_delta,
+        min_open_interest=args.min_open_interest,
+        min_option_volume=args.min_option_volume,
+        max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
+        max_call_bid_extrinsic_pct_of_spot=args.max_call_bid_extrinsic_pct_of_spot,
+        covered_call_live_quote_safety_pct=args.covered_call_live_quote_safety_pct,
+        max_cc_underlying_day_change_abs_pct=args.max_cc_underlying_day_change_abs_pct,
+        max_csp_underlying_price=(
+            args.max_csp_underlying_price if args.max_csp_underlying_price > 0 else None
+        ),
+        max_atm_strike_distance_pct=args.max_atm_strike_distance_pct,
+        max_premium_yield_stock_price=(
+            args.max_premium_yield_stock_price
+            if args.max_premium_yield_stock_price > 0
+            else None
+        ),
+        top_n=args.top_n,
+        max_expiry_days=args.max_expiry_days,
+        include_extended_spot=args.include_extended_spot,
+        max_workers=args.max_workers,
+        retries=args.retries,
+    )
+
+    output = scan_tickers(tickers, config)
+    candidates_path = args.outdir / f"{config.strategy}_candidates.csv"
+    diagnostics_path = args.outdir / f"{config.strategy}_diagnostics.csv"
+    errors_path = args.outdir / f"{config.strategy}_errors.csv"
+
+    write_csv(output.candidates, candidates_path)
+    if args.debug:
+        write_csv(output.diagnostics, diagnostics_path)
+    if output.errors:
+        write_csv(output.errors, errors_path)
+
+    print(f"Qualified candidates: {len(output.candidates)}")
+    print(f"Saved: {candidates_path}")
+
+
+if __name__ == "__main__":
+    main()
