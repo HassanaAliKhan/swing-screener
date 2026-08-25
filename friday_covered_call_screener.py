@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.08.csp-closest-delta-then-yield-v9"
+BACKEND_VERSION = "2026.08.extended-spot-priority-v10"
 Strategy = Literal["covered_call", "cash_secured_put", "csp_delta_yield", "premium_yield_call"]
 
 
@@ -175,29 +175,69 @@ def _last_non_null_close(frame: pd.DataFrame) -> tuple[float, str | None]:
 
 
 def fetch_spot(ticker_obj: yf.Ticker, include_extended: bool) -> tuple[float, str, str | None]:
-    try:
-        fast = ticker_obj.fast_info
-        for key in ("lastPrice", "last_price"):
-            value = safe_float(fast.get(key))
-            if value > 0:
-                return value, "fast_info.lastPrice", None
-    except Exception:
-        pass
+    """Get the best available underlying reference price.
 
-    for interval in ("1m", "5m"):
+    When extended-hours pricing is enabled, prefer the newest 1-minute/5-minute
+    premarket or after-hours close. Only fall back to fast_info.lastPrice if
+    Yahoo does not provide usable intraday extended-hours data.
+
+    When extended-hours pricing is disabled, prefer fast_info.lastPrice first,
+    preserving the prior regular-session behavior.
+    """
+
+    if include_extended:
+        for interval in ("1m", "5m"):
+            try:
+                history = ticker_obj.history(
+                    period="5d",
+                    interval=interval,
+                    auto_adjust=False,
+                    prepost=True,
+                    raise_errors=False,
+                )
+                value, timestamp = _last_non_null_close(history)
+                if value > 0:
+                    return value, f"history {interval} prepost close", timestamp
+            except Exception:
+                pass
+
+        # Extended-hours requested but Yahoo did not supply a usable intraday
+        # pre/post quote. Fall back to the regular last price.
         try:
-            history = ticker_obj.history(
-                period="5d",
-                interval=interval,
-                auto_adjust=False,
-                prepost=include_extended,
-                raise_errors=False,
-            )
-            value, timestamp = _last_non_null_close(history)
-            if value > 0:
-                return value, f"history {interval} close", timestamp
+            fast = ticker_obj.fast_info
+            for key in ("lastPrice", "last_price"):
+                value = safe_float(fast.get(key))
+                if value > 0:
+                    return value, "fast_info.lastPrice fallback", None
         except Exception:
             pass
+
+    else:
+        # Preserve the original regular-session preference when extended-hours
+        # pricing is not requested.
+        try:
+            fast = ticker_obj.fast_info
+            for key in ("lastPrice", "last_price"):
+                value = safe_float(fast.get(key))
+                if value > 0:
+                    return value, "fast_info.lastPrice", None
+        except Exception:
+            pass
+
+        for interval in ("1m", "5m"):
+            try:
+                history = ticker_obj.history(
+                    period="5d",
+                    interval=interval,
+                    auto_adjust=False,
+                    prepost=False,
+                    raise_errors=False,
+                )
+                value, timestamp = _last_non_null_close(history)
+                if value > 0:
+                    return value, f"history {interval} regular close", timestamp
+            except Exception:
+                pass
 
     raise ValueError("Unable to obtain a valid underlying price from Yahoo")
 
