@@ -16,7 +16,10 @@ st.set_page_config(
     layout="wide",
 )
 
-DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
+WATCHLIST_FILES = {
+    "All": Path(__file__).with_name("watchlist_all.txt"),
+    "DC infrastructure": Path(__file__).with_name("watchlist_dc_infra.txt"),
+}
 
 
 STRATEGY_LABELS = {
@@ -27,9 +30,10 @@ STRATEGY_LABELS = {
 }
 
 
-def default_watchlist() -> str:
-    if DEFAULT_WATCHLIST.exists():
-        return DEFAULT_WATCHLIST.read_text(encoding="utf-8")
+def load_watchlist(name: str) -> str:
+    path = WATCHLIST_FILES[name]
+    if path.exists():
+        return path.read_text(encoding="utf-8")
     return "# Add one ticker per line\n"
 
 
@@ -286,20 +290,48 @@ st.caption(
     "by premium yield on collateral."
 )
 
+if "option_income_watchlist_choice" not in st.session_state:
+    st.session_state.option_income_watchlist_choice = "All"
+
+if "option_income_loaded_watchlist" not in st.session_state:
+    st.session_state.option_income_loaded_watchlist = st.session_state.option_income_watchlist_choice
+
 if "option_income_watchlist_text" not in st.session_state:
-    st.session_state.option_income_watchlist_text = default_watchlist()
+    st.session_state.option_income_watchlist_text = load_watchlist(
+        st.session_state.option_income_watchlist_choice
+    )
 
 with st.expander("Watchlist and scan settings", expanded=True):
-    left, right = st.columns([1, 4])
-    with left:
-        if st.button("Reload saved watchlist from GitHub"):
-            st.session_state.option_income_watchlist_text = default_watchlist()
+    watch_col, reload_col, note_col = st.columns([2, 1, 4])
+
+    with watch_col:
+        selected_watchlist = st.selectbox(
+            "Watchlist",
+            options=list(WATCHLIST_FILES),
+            key="option_income_watchlist_choice",
+        )
+
+    if selected_watchlist != st.session_state.option_income_loaded_watchlist:
+        st.session_state.option_income_watchlist_text = load_watchlist(selected_watchlist)
+        st.session_state.option_income_loaded_watchlist = selected_watchlist
+        st.rerun()
+
+    with reload_col:
+        st.write("")
+        st.write("")
+        if st.button("Reload selected"):
+            st.session_state.option_income_watchlist_text = load_watchlist(selected_watchlist)
+            st.session_state.option_income_loaded_watchlist = selected_watchlist
             st.rerun()
-    with right:
-        st.caption("For permanent defaults, edit `watchlist.txt` in GitHub.")
+
+    with note_col:
+        st.caption(
+            "All uses `watchlist_all.txt`. DC infrastructure uses "
+            "`watchlist_dc_infra.txt`. Edit either file in GitHub to change its saved defaults."
+        )
 
     st.text_area(
-        "Watchlist",
+        "Tickers",
         key="option_income_watchlist_text",
         height=220,
     )
