@@ -351,7 +351,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 "Minimum signed put delta",
                 min_value=-0.50,
                 max_value=-0.01,
-                value=-0.10,
+                value=-0.20,
                 step=0.01,
                 help=(
                     "Only estimated put deltas greater than or equal to this value qualify. "
