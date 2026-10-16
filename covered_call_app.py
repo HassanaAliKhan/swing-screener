@@ -103,6 +103,8 @@ def candidate_columns(strategy: str) -> list[str]:
             "DownsideCushion_pct",
             "MaxProfitIfCalled_pct",
             "UnderlyingMoves_D_W_M_3M",
+            "UnderlyingRefPrices_D_W_M_3M",
+            "UnderlyingAvgPrices_D_W_M_3M",
             "BidAskSpread_pct",
             "OpenInterest",
             "OptionVolume",
@@ -118,6 +120,8 @@ def candidate_columns(strategy: str) -> list[str]:
             "Strike",
             "RobinhoodChain",
             "UnderlyingMoves_D_W_M_3M",
+            "UnderlyingRefPrices_D_W_M_3M",
+            "UnderlyingAvgPrices_D_W_M_3M",
             "Expiry",
             "DaysToExpiry",
             "StrikeDiscount_pct",
@@ -139,6 +143,8 @@ def candidate_columns(strategy: str) -> list[str]:
             "Spot",
             "RobinhoodChain",
             "UnderlyingMoves_D_W_M_3M",
+            "UnderlyingRefPrices_D_W_M_3M",
+            "UnderlyingAvgPrices_D_W_M_3M",
             "Expiry",
             "DaysToExpiry",
             "Strike",
@@ -157,6 +163,8 @@ def candidate_columns(strategy: str) -> list[str]:
 
     return common + [
         "UnderlyingMoves_D_W_M_3M",
+        "UnderlyingRefPrices_D_W_M_3M",
+        "UnderlyingAvgPrices_D_W_M_3M",
         "StrikeDiscount_pct",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
@@ -198,9 +206,19 @@ def candidate_column_config(strategy: str) -> dict:
         "OptionVolume": st.column_config.NumberColumn("Volume"),
         "ImpliedVolatility_pct": st.column_config.NumberColumn("IV", format="%.2f%%"),
         "UnderlyingMoves_D_W_M_3M": st.column_config.TextColumn(
-            "Stock move (D / W / M / 3M)",
-            width=430,
-            help="Percent changes over 1 day, 1 week, 1 month and 3 months. — means data unavailable.",
+            "Stock move (D/W/M/3M)",
+            width=415,
+            help="Price change from the historical reference close to the current spot.",
+        ),
+        "UnderlyingRefPrices_D_W_M_3M": st.column_config.TextColumn(
+            "Price then (D/W/M/3M)",
+            width=360,
+            help="D = previous session close; W/M/3M = historical closing price on or before the lookback date.",
+        ),
+        "UnderlyingAvgPrices_D_W_M_3M": st.column_config.TextColumn(
+            "Avg price (D/W/M/3M)",
+            width=360,
+            help="D = latest trading day's OHLC4 (open/high/low/close average, an approximation); W/M/3M = mean of daily closing prices within each trailing period.",
         ),
     }
 
@@ -671,6 +689,12 @@ if "option_income_output" in st.session_state:
             hide_index=True,
             column_config=candidate_column_config(displayed_strategy),
         )
+        st.caption(
+            "History: D = day, W = week, M = month, 3M = three months. "
+            "Price then = previous close (D) or closing price at the lookback date (W/M/3M). "
+            "Avg = latest-day OHLC4 approximation (D), or mean of daily closes over the period (W/M/3M). "
+            "— means insufficient historical data."
+        )
 
         if displayed_strategy == "premium_yield_call":
             st.caption(
@@ -722,4 +746,5 @@ if "option_income_output" in st.session_state:
                 errors,
                 use_container_width=True,
                 hide_index=True,
+            )
             )
