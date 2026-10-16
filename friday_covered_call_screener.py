@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.10.multi-horizon-price-moves-v11"
+BACKEND_VERSION = "2026.10.multi-horizon-prices-and-averages-v12"
 Strategy = Literal["covered_call", "cash_secured_put", "csp_delta_yield", "premium_yield_call"]
 
 
@@ -281,23 +281,33 @@ def _trailing_stock_changes(
     ticker_obj: yf.Ticker,
     spot: float,
     as_of: date,
+    previous_close: float = math.nan,
 ) -> dict[str, float]:
-    """Price returns for 1W, 1M, 3M relative to the current spot.
+    """Historical returns, reference prices, and trailing average prices.
 
-    The baseline for each period is the final available regular-session
-    unadjusted Close *on or before* the target calendar date. Consequently,
-    weekends and market holidays do not create gaps in the series.
-
-    Only requested for qualifying candidates. Missing/insufficient price history
-    gives NaN rather than an invented zero-percent return.
+    D reference: previous regular-session close. D average: today's (or the
+    latest available session's) OHLC4 price, a daily average *proxy*.
+    W/M/3M reference: final daily close on/before the calendar lookback date.
+    W/M/3M average: arithmetic mean of available daily closes in that window.
+    Prices are unadjusted to match the screener's live unadjusted Spot quote.
+    Missing historical data stays NaN; no fabricated values or zero returns.
+    Fetch one 6-month daily history for each *qualified* ticker only.
     """
-    changes = {
+    result = {
         "UnderlyingWeekChange_pct": math.nan,
         "UnderlyingMonthChange_pct": math.nan,
         "Underlying3MonthChange_pct": math.nan,
+        "UnderlyingDayReferencePrice": round_or_nan(previous_close),
+        "UnderlyingWeekReferencePrice": math.nan,
+        "UnderlyingMonthReferencePrice": math.nan,
+        "Underlying3MonthReferencePrice": math.nan,
+        "UnderlyingDayAveragePrice": math.nan,
+        "UnderlyingWeekAveragePrice": math.nan,
+        "UnderlyingMonthAveragePrice": math.nan,
+        "Underlying3MonthAveragePrice": math.nan,
     }
     if not math.isfinite(spot) or spot <= 0:
-        return changes
+        return result
 
     try:
         history = ticker_obj.history(
@@ -308,37 +318,59 @@ def _trailing_stock_changes(
             raise_errors=False,
         )
         if history is None or history.empty or "Close" not in history.columns:
-            return changes
-        closes = pd.to_numeric(history["Close"], errors="coerce").dropna()
-        if closes.empty:
-            return changes
+            return result
+        # Normalize exchange-local session dates, without UTC shifting.
+        session_index = pd.DatetimeIndex(history.index)
+        if session_index.tz is not None:
+            session_index = session_index.tz_localize(None)
+        session_index = session_index.normalize()
 
-        # yfinance usually supplies a timezone-aware exchange-local index.
-        # Remove timezone without moving its local calendar day.
-        dates = pd.DatetimeIndex(closes.index)
-        if dates.tz is not None:
-            dates = dates.tz_localize(None)
-        dates = dates.normalize()
-        by_day = pd.Series(closes.to_numpy(dtype=float), index=dates)
+        by_day = history.copy()
+        by_day.index = session_index
         by_day = by_day.loc[~by_day.index.duplicated(keep="last")].sort_index()
         as_of_ts = pd.Timestamp(as_of)
+        by_day = by_day.loc[by_day.index <= as_of_ts]
+        if by_day.empty:
+            return result
 
-        boundaries = {
-            "UnderlyingWeekChange_pct": as_of_ts - pd.DateOffset(weeks=1),
-            "UnderlyingMonthChange_pct": as_of_ts - pd.DateOffset(months=1),
-            "Underlying3MonthChange_pct": as_of_ts - pd.DateOffset(months=3),
+        closes = pd.to_numeric(by_day["Close"], errors="coerce")
+        closes = closes.loc[(closes > 0) & closes.notna()]
+        if closes.empty:
+            return result
+
+        # Use OHLC4 as an approximation for 1-day average stock price.
+        # It is NOT the volume-weighted execution price or intraday VWAP.
+        latest_bar = by_day.loc[closes.index[-1]]
+        ohlc = [safe_float(latest_bar.get(col)) for col in ("Open", "High", "Low", "Close")]
+        if all(math.isfinite(value) and value > 0 for value in ohlc):
+            result["UnderlyingDayAveragePrice"] = round_or_nan(sum(ohlc) / 4.0, 4)
+
+        windows = {
+            "Week": as_of_ts - pd.DateOffset(weeks=1),
+            "Month": as_of_ts - pd.DateOffset(months=1),
+            "3Month": as_of_ts - pd.DateOffset(months=3),
         }
-        for key, cutoff in boundaries.items():
-            eligible = by_day.loc[by_day.index <= cutoff]
-            if not eligible.empty:
-                old_close = safe_float(eligible.iloc[-1])
-                if old_close > 0:
-                    changes[key] = round_or_nan((spot / old_close - 1.0) * 100.0)
+        for period, cutoff in windows.items():
+            # Use last close <= boundary, so weekends/holidays work.
+            before = closes.loc[closes.index <= cutoff]
+            if before.empty:
+                continue  # Too new for this period; do not present a false average.
+            baseline = safe_float(before.iloc[-1])
+            if baseline <= 0:
+                continue
+            result[f"Underlying{period}ReferencePrice"] = round_or_nan(baseline, 4)
+            result[f"Underlying{period}Change_pct"] = round_or_nan(
+                (spot / baseline - 1.0) * 100.0
+            )
+            trailing = closes.loc[closes.index > cutoff]
+            if not trailing.empty:
+                result[f"Underlying{period}AveragePrice"] = round_or_nan(
+                    float(trailing.mean()), 4
+                )
     except Exception:
-        # Failure to retrieve optional trend columns must never reject a valid
-        # options candidate or become a screener data error.
+        # Optional historical values must not reject otherwise valid CSPs.
         pass
-    return changes
+    return result
 
 
 def format_stock_change(value: float) -> str:
@@ -346,13 +378,32 @@ def format_stock_change(value: float) -> str:
     return f"{value:+.2f}%" if math.isfinite(safe_float(value)) else "—"
 
 
+def format_stock_price(value: float) -> str:
+    """Preserve sub-dollar price precision without cluttering normal quotes."""
+    number = safe_float(value)
+    if not math.isfinite(number) or number <= 0:
+        return "—"
+    digits = 4 if number < 0.1 else (3 if number < 1 else 2)
+    return f"${number:,.{digits}f}"
+
+
 def format_stock_moves(day: float, week: float, month: float, three_months: float) -> str:
-    """Single display-ready dashboard cell: D / W / M / 3M."""
+    """Single dashboard cell: D / W / M / 3M return percentages."""
     return (
         f"D {format_stock_change(day)}  |  "
         f"W {format_stock_change(week)}  |  "
         f"M {format_stock_change(month)}  |  "
         f"3M {format_stock_change(three_months)}"
+    )
+
+
+def format_stock_prices(day: float, week: float, month: float, three_months: float) -> str:
+    """Display-ready prices for D / W / M / 3M in one table column."""
+    return (
+        f"D {format_stock_price(day)}  |  "
+        f"W {format_stock_price(week)}  |  "
+        f"M {format_stock_price(month)}  |  "
+        f"3M {format_stock_price(three_months)}"
     )
 
 
@@ -1069,6 +1120,7 @@ def scan_one_ticker(
                     ticker_obj=ticker_obj,
                     spot=spot,
                     as_of=config.today or date.today(),
+                    previous_close=previous_close,
                 )
                 if candidate is not None else {}
             )
@@ -1080,6 +1132,18 @@ def scan_one_ticker(
                     extra_moves["UnderlyingWeekChange_pct"],
                     extra_moves["UnderlyingMonthChange_pct"],
                     extra_moves["Underlying3MonthChange_pct"],
+                )
+                candidate["UnderlyingRefPrices_D_W_M_3M"] = format_stock_prices(
+                    extra_moves["UnderlyingDayReferencePrice"],
+                    extra_moves["UnderlyingWeekReferencePrice"],
+                    extra_moves["UnderlyingMonthReferencePrice"],
+                    extra_moves["Underlying3MonthReferencePrice"],
+                )
+                candidate["UnderlyingAvgPrices_D_W_M_3M"] = format_stock_prices(
+                    extra_moves["UnderlyingDayAveragePrice"],
+                    extra_moves["UnderlyingWeekAveragePrice"],
+                    extra_moves["UnderlyingMonthAveragePrice"],
+                    extra_moves["Underlying3MonthAveragePrice"],
                 )
 
             diagnostic = {
