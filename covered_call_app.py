@@ -23,8 +23,8 @@ WATCHLIST_FILES = {
 
 
 STRATEGY_LABELS = {
-    "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
     "Cash-secured puts — low delta, maximum yield": "csp_delta_yield",
+    "Cash-secured puts — prioritize downside buffer": "cash_secured_put",
     "Covered calls — maximum ATM premium yield": "premium_yield_call",
     "Covered calls — deep ITM assignment return": "covered_call",
 }
@@ -102,7 +102,7 @@ def candidate_columns(strategy: str) -> list[str]:
             "CoveredCallBreakeven",
             "DownsideCushion_pct",
             "MaxProfitIfCalled_pct",
-            "UnderlyingDayChange_pct",
+            "UnderlyingMoves_D_W_M_3M",
             "BidAskSpread_pct",
             "OpenInterest",
             "OptionVolume",
@@ -117,7 +117,7 @@ def candidate_columns(strategy: str) -> list[str]:
             "Spot",
             "Strike",
             "RobinhoodChain",
-            "UnderlyingDayChange_pct",
+            "UnderlyingMoves_D_W_M_3M",
             "Expiry",
             "DaysToExpiry",
             "StrikeDiscount_pct",
@@ -138,7 +138,7 @@ def candidate_columns(strategy: str) -> list[str]:
             "Ticker",
             "Spot",
             "RobinhoodChain",
-            "UnderlyingDayChange_pct",
+            "UnderlyingMoves_D_W_M_3M",
             "Expiry",
             "DaysToExpiry",
             "Strike",
@@ -156,6 +156,7 @@ def candidate_columns(strategy: str) -> list[str]:
         ]
 
     return common + [
+        "UnderlyingMoves_D_W_M_3M",
         "StrikeDiscount_pct",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
@@ -196,6 +197,11 @@ def candidate_column_config(strategy: str) -> dict:
         "OpenInterest": st.column_config.NumberColumn("OI"),
         "OptionVolume": st.column_config.NumberColumn("Volume"),
         "ImpliedVolatility_pct": st.column_config.NumberColumn("IV", format="%.2f%%"),
+        "UnderlyingMoves_D_W_M_3M": st.column_config.TextColumn(
+            "Stock move (D / W / M / 3M)",
+            width=430,
+            help="Percent changes over 1 day, 1 week, 1 month and 3 months. — means data unavailable.",
+        ),
     }
 
     if strategy == "premium_yield_call":
@@ -225,17 +231,11 @@ def candidate_column_config(strategy: str) -> dict:
                 "MaxProfitIfCalled_pct": st.column_config.NumberColumn(
                     "Max profit if called", format="%.2f%%"
                 ),
-                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
-                    "Stock day move", format="%.2f%%"
-                ),
             }
         )
     elif strategy in ("cash_secured_put", "csp_delta_yield"):
         config.update(
             {
-                "UnderlyingDayChange_pct": st.column_config.NumberColumn(
-                    "Stock day move", format="%.2f%%"
-                ),
                 "StrikeDiscount_pct": st.column_config.NumberColumn(
                     "Strike discount", format="%.2f%%"
                 ),
@@ -285,7 +285,7 @@ def candidate_column_config(strategy: str) -> dict:
 
 st.title("Option-Income Screener")
 st.caption(
-    "Cash-secured puts are the default strategy. The low-delta CSP mode uses Bid, "
+    "Low-delta cash-secured puts (maximum yield) are the default strategy. This mode uses Bid, "
     "the furthest listed expiration within the selected DTE cap, and ranks qualifying stocks "
     "by premium yield on collateral."
 )
@@ -339,7 +339,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
     strategy_label = st.selectbox(
         "Strategy",
         options=list(STRATEGY_LABELS),
-        index=0,
+        index=list(STRATEGY_LABELS).index("Cash-secured puts — low delta, maximum yield"),
     )
     strategy = STRATEGY_LABELS[strategy_label]
 
@@ -355,7 +355,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
                 step=0.01,
                 help=(
                     "Only estimated put deltas greater than or equal to this value qualify. "
-                    "At the default -0.10, accepted puts have -0.10 <= delta < 0.00, "
+                    "At the default -0.20, accepted puts have -0.20 <= delta < 0.00, "
                     "which favors farther-OTM, lower-sensitivity puts."
                 ),
             )
@@ -689,7 +689,7 @@ if "option_income_output" in st.session_state:
             st.caption(
                 "Ranked by premium yield on collateral, highest first. Uses Bid and the furthest listed "
                 "expiration within the selected DTE cap. At the default threshold, only estimated signed "
-                "put deltas from -0.10 up to (but not including) 0.00 qualify."
+                "put deltas from -0.20 up to (but not including) 0.00 qualify."
             )
             filename = "csp_low_delta_max_yield.csv"
         else:
