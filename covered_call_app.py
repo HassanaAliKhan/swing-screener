@@ -104,7 +104,6 @@ def candidate_columns(strategy: str) -> list[str]:
             "MaxProfitIfCalled_pct",
             "UnderlyingMoves_D_W_M_3M",
             "UnderlyingRefPrices_D_W_M_3M",
-            "UnderlyingAvgPrices_D_W_M_3M",
             "BidAskSpread_pct",
             "OpenInterest",
             "OptionVolume",
@@ -121,7 +120,6 @@ def candidate_columns(strategy: str) -> list[str]:
             "RobinhoodChain",
             "UnderlyingMoves_D_W_M_3M",
             "UnderlyingRefPrices_D_W_M_3M",
-            "UnderlyingAvgPrices_D_W_M_3M",
             "Expiry",
             "DaysToExpiry",
             "StrikeDiscount_pct",
@@ -144,7 +142,6 @@ def candidate_columns(strategy: str) -> list[str]:
             "RobinhoodChain",
             "UnderlyingMoves_D_W_M_3M",
             "UnderlyingRefPrices_D_W_M_3M",
-            "UnderlyingAvgPrices_D_W_M_3M",
             "Expiry",
             "DaysToExpiry",
             "Strike",
@@ -164,7 +161,6 @@ def candidate_columns(strategy: str) -> list[str]:
     return common + [
         "UnderlyingMoves_D_W_M_3M",
         "UnderlyingRefPrices_D_W_M_3M",
-        "UnderlyingAvgPrices_D_W_M_3M",
         "StrikeDiscount_pct",
         "AssignmentBreakEven",
         "AssignmentProfit_pct",
@@ -214,11 +210,6 @@ def candidate_column_config(strategy: str) -> dict:
             "Price then (D/W/M/3M)",
             width=360,
             help="D = previous session close; W/M/3M = historical closing price on or before the lookback date.",
-        ),
-        "UnderlyingAvgPrices_D_W_M_3M": st.column_config.TextColumn(
-            "Avg price (D/W/M/3M)",
-            width=360,
-            help="D = latest trading day's OHLC4 (open/high/low/close average, an approximation); W/M/3M = mean of daily closing prices within each trailing period.",
         ),
     }
 
@@ -692,7 +683,6 @@ if "option_income_output" in st.session_state:
         st.caption(
             "History: D = day, W = week, M = month, 3M = three months. "
             "Price then = previous close (D) or closing price at the lookback date (W/M/3M). "
-            "Avg = latest-day OHLC4 approximation (D), or mean of daily closes over the period (W/M/3M). "
             "— means insufficient historical data."
         )
 
