@@ -38,7 +38,7 @@ except ImportError as exc:
 
 
 DEFAULT_WATCHLIST = Path(__file__).with_name("watchlist.txt")
-BACKEND_VERSION = "2026.08.extended-spot-priority-v10"
+BACKEND_VERSION = "2026.10.multi-horizon-price-moves-v11"
 Strategy = Literal["covered_call", "cash_secured_put", "csp_delta_yield", "premium_yield_call"]
 
 
@@ -275,6 +275,85 @@ def day_change_pct(spot: float, previous_close: float) -> float:
     if not math.isfinite(spot) or not math.isfinite(previous_close) or previous_close <= 0:
         return math.nan
     return (spot - previous_close) / previous_close * 100.0
+
+
+def _trailing_stock_changes(
+    ticker_obj: yf.Ticker,
+    spot: float,
+    as_of: date,
+) -> dict[str, float]:
+    """Price returns for 1W, 1M, 3M relative to the current spot.
+
+    The baseline for each period is the final available regular-session
+    unadjusted Close *on or before* the target calendar date. Consequently,
+    weekends and market holidays do not create gaps in the series.
+
+    Only requested for qualifying candidates. Missing/insufficient price history
+    gives NaN rather than an invented zero-percent return.
+    """
+    changes = {
+        "UnderlyingWeekChange_pct": math.nan,
+        "UnderlyingMonthChange_pct": math.nan,
+        "Underlying3MonthChange_pct": math.nan,
+    }
+    if not math.isfinite(spot) or spot <= 0:
+        return changes
+
+    try:
+        history = ticker_obj.history(
+            period="6mo",
+            interval="1d",
+            auto_adjust=False,
+            prepost=False,
+            raise_errors=False,
+        )
+        if history is None or history.empty or "Close" not in history.columns:
+            return changes
+        closes = pd.to_numeric(history["Close"], errors="coerce").dropna()
+        if closes.empty:
+            return changes
+
+        # yfinance usually supplies a timezone-aware exchange-local index.
+        # Remove timezone without moving its local calendar day.
+        dates = pd.DatetimeIndex(closes.index)
+        if dates.tz is not None:
+            dates = dates.tz_localize(None)
+        dates = dates.normalize()
+        by_day = pd.Series(closes.to_numpy(dtype=float), index=dates)
+        by_day = by_day.loc[~by_day.index.duplicated(keep="last")].sort_index()
+        as_of_ts = pd.Timestamp(as_of)
+
+        boundaries = {
+            "UnderlyingWeekChange_pct": as_of_ts - pd.DateOffset(weeks=1),
+            "UnderlyingMonthChange_pct": as_of_ts - pd.DateOffset(months=1),
+            "Underlying3MonthChange_pct": as_of_ts - pd.DateOffset(months=3),
+        }
+        for key, cutoff in boundaries.items():
+            eligible = by_day.loc[by_day.index <= cutoff]
+            if not eligible.empty:
+                old_close = safe_float(eligible.iloc[-1])
+                if old_close > 0:
+                    changes[key] = round_or_nan((spot / old_close - 1.0) * 100.0)
+    except Exception:
+        # Failure to retrieve optional trend columns must never reject a valid
+        # options candidate or become a screener data error.
+        pass
+    return changes
+
+
+def format_stock_change(value: float) -> str:
+    """Keep a missing return distinct from 0%; show explicit positive signs."""
+    return f"{value:+.2f}%" if math.isfinite(safe_float(value)) else "—"
+
+
+def format_stock_moves(day: float, week: float, month: float, three_months: float) -> str:
+    """Single display-ready dashboard cell: D / W / M / 3M."""
+    return (
+        f"D {format_stock_change(day)}  |  "
+        f"W {format_stock_change(week)}  |  "
+        f"M {format_stock_change(month)}  |  "
+        f"3M {format_stock_change(three_months)}"
+    )
 
 
 def quote_mark(bid: float, ask: float) -> float:
@@ -981,6 +1060,26 @@ def scan_one_ticker(
                 candidate, reason = select_covered_call(
                     ticker, spot, chain.calls, expiry, expiry_note, config,
                     spot_source, spot_timestamp, underlying_day_change
+                )
+
+            # Enrich only qualified results. Preserve numeric day-change for
+            # backwards compatibility with existing filters and consumers.
+            extra_moves = (
+                _trailing_stock_changes(
+                    ticker_obj=ticker_obj,
+                    spot=spot,
+                    as_of=config.today or date.today(),
+                )
+                if candidate is not None else {}
+            )
+            if candidate is not None:
+                candidate["UnderlyingDayChange_pct"] = round_or_nan(underlying_day_change)
+                candidate.update(extra_moves)
+                candidate["UnderlyingMoves_D_W_M_3M"] = format_stock_moves(
+                    underlying_day_change,
+                    extra_moves["UnderlyingWeekChange_pct"],
+                    extra_moves["UnderlyingMonthChange_pct"],
+                    extra_moves["Underlying3MonthChange_pct"],
                 )
 
             diagnostic = {
