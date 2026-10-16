@@ -283,12 +283,10 @@ def _trailing_stock_changes(
     as_of: date,
     previous_close: float = math.nan,
 ) -> dict[str, float]:
-    """Historical returns, reference prices, and trailing average prices.
+    """Historical returns and reference prices (D / W / M / 3M).
 
-    D reference: previous regular-session close. D average: today's (or the
-    latest available session's) OHLC4 price, a daily average *proxy*.
+    D reference: previous regular-session close.
     W/M/3M reference: final daily close on/before the calendar lookback date.
-    W/M/3M average: arithmetic mean of available daily closes in that window.
     Prices are unadjusted to match the screener's live unadjusted Spot quote.
     Missing historical data stays NaN; no fabricated values or zero returns.
     Fetch one 6-month daily history for each *qualified* ticker only.
@@ -301,10 +299,6 @@ def _trailing_stock_changes(
         "UnderlyingWeekReferencePrice": math.nan,
         "UnderlyingMonthReferencePrice": math.nan,
         "Underlying3MonthReferencePrice": math.nan,
-        "UnderlyingDayAveragePrice": math.nan,
-        "UnderlyingWeekAveragePrice": math.nan,
-        "UnderlyingMonthAveragePrice": math.nan,
-        "Underlying3MonthAveragePrice": math.nan,
     }
     if not math.isfinite(spot) or spot <= 0:
         return result
@@ -338,13 +332,6 @@ def _trailing_stock_changes(
         if closes.empty:
             return result
 
-        # Use OHLC4 as an approximation for 1-day average stock price.
-        # It is NOT the volume-weighted execution price or intraday VWAP.
-        latest_bar = by_day.loc[closes.index[-1]]
-        ohlc = [safe_float(latest_bar.get(col)) for col in ("Open", "High", "Low", "Close")]
-        if all(math.isfinite(value) and value > 0 for value in ohlc):
-            result["UnderlyingDayAveragePrice"] = round_or_nan(sum(ohlc) / 4.0, 4)
-
         windows = {
             "Week": as_of_ts - pd.DateOffset(weeks=1),
             "Month": as_of_ts - pd.DateOffset(months=1),
@@ -362,11 +349,6 @@ def _trailing_stock_changes(
             result[f"Underlying{period}Change_pct"] = round_or_nan(
                 (spot / baseline - 1.0) * 100.0
             )
-            trailing = closes.loc[closes.index > cutoff]
-            if not trailing.empty:
-                result[f"Underlying{period}AveragePrice"] = round_or_nan(
-                    float(trailing.mean()), 4
-                )
     except Exception:
         # Optional historical values must not reject otherwise valid CSPs.
         pass
@@ -1138,12 +1120,6 @@ def scan_one_ticker(
                     extra_moves["UnderlyingWeekReferencePrice"],
                     extra_moves["UnderlyingMonthReferencePrice"],
                     extra_moves["Underlying3MonthReferencePrice"],
-                )
-                candidate["UnderlyingAvgPrices_D_W_M_3M"] = format_stock_prices(
-                    extra_moves["UnderlyingDayAveragePrice"],
-                    extra_moves["UnderlyingWeekAveragePrice"],
-                    extra_moves["UnderlyingMonthAveragePrice"],
-                    extra_moves["Underlying3MonthAveragePrice"],
                 )
 
             diagnostic = {
