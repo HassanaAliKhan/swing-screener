@@ -114,15 +114,15 @@ with st.expander("Watchlist and scan settings", expanded=True):
     r2 = st.columns(4)
     with r2[0]:
         min_oi = st.number_input(
-            "Minimum OI per leg", min_value=0, max_value=1_000_000, value=5, step=5
+            "Minimum OI per short leg", min_value=0, max_value=1_000_000, value=5, step=5
         )
     with r2[1]:
         min_vol = st.number_input(
-            "Minimum volume per leg", min_value=0, max_value=1_000_000, value=1, step=1
+            "Minimum volume per short leg", min_value=0, max_value=1_000_000, value=1, step=1
         )
     with r2[2]:
         max_spread = st.number_input(
-            "Maximum bid-ask spread per leg (%)",
+            "Maximum bid-ask spread per short leg (%)",
             min_value=1.0,
             max_value=1000.0,
             value=500.0,
