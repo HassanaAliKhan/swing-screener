@@ -271,24 +271,29 @@ def select_iron_condor(
         - (config.today or date.today())
     ).days
 
-    def liquid(frame: pd.DataFrame) -> pd.DataFrame:
-        spread_ok = frame["BidAskSpread_pct"].isna() | (
-            frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
-        )
+    def valid_long_leg(frame: pd.DataFrame) -> pd.DataFrame:
+        # Protective long wings only need a valid executable ask and a regular contract.
+        # Do not require same-day volume or minimum OI: farther-OTM wings often print
+        # zero volume even when they are available to trade.
         return frame.loc[
             (frame["strike"] > 0)
             & (frame["ask"] > 0)
-            & (frame["openInterest"].fillna(0) >= config.min_open_interest)
-            & (frame["volume"].fillna(0) >= config.min_option_volume)
-            & spread_ok
             & _regular_contract_mask(frame)
         ].copy()
 
-    put_frame = liquid(put_frame)
-    call_frame = liquid(call_frame)
+    put_frame = valid_long_leg(put_frame)
+    call_frame = valid_long_leg(call_frame)
 
     if put_frame.empty or call_frame.empty:
-        return None, "No liquid put/call contracts passed active quote filters"
+        return None, "No valid put/call contracts with executable asks"
+
+    # Liquidity and spread thresholds apply to the two short premium-selling legs.
+    put_short_spread_ok = put_frame["BidAskSpread_pct"].notna() & (
+        put_frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
+    )
+    call_short_spread_ok = call_frame["BidAskSpread_pct"].notna() & (
+        call_frame["BidAskSpread_pct"] <= config.max_bid_ask_spread_pct
+    )
 
     max_short_dist = spot * config.max_short_distance_pct_of_spot / 100.0
     max_wing_width = max(0.5, spot * config.max_wing_width_pct_of_spot / 100.0)
@@ -297,16 +302,22 @@ def select_iron_condor(
         (put_frame["strike"] < spot)
         & ((spot - put_frame["strike"]) <= max_short_dist)
         & (put_frame["bid"] > 0)
-    ].sort_values("strike", ascending=False).head(12)
+        & (put_frame["openInterest"].fillna(0) >= config.min_open_interest)
+        & (put_frame["volume"].fillna(0) >= config.min_option_volume)
+        & put_short_spread_ok
+    ].sort_values("strike", ascending=False).head(16)
 
     short_calls = call_frame.loc[
         (call_frame["strike"] > spot)
         & ((call_frame["strike"] - spot) <= max_short_dist)
         & (call_frame["bid"] > 0)
-    ].sort_values("strike", ascending=True).head(12)
+        & (call_frame["openInterest"].fillna(0) >= config.min_open_interest)
+        & (call_frame["volume"].fillna(0) >= config.min_option_volume)
+        & call_short_spread_ok
+    ].sort_values("strike", ascending=True).head(16)
 
     if short_puts.empty or short_calls.empty:
-        return None, "No OTM short legs passed active filters"
+        return None, "No OTM short put/call legs passed short-leg bid, OI, volume, and spread filters"
 
     best: dict | None = None
     best_key: tuple | None = None
@@ -436,7 +447,7 @@ def select_iron_condor(
                         }
 
     if best is None:
-        return None, "No executable iron condor met active filters"
+        return None, "No positive-credit iron condor met the wing-width and profit/loss filters after short-leg liquidity screening"
 
     return best, (
         "Selected widest profit zone, then highest max-profit/max-loss ratio"
