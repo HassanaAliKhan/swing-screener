@@ -143,7 +143,9 @@ st.title("Iron Condor Screener")
 st.caption(
     "Ranks valid iron condors with a 0-100 score: 45% wider breakeven range, "
     "35% higher max-profit/max-loss ratio, 15% higher max profit, and "
-    "5% lower max loss. Sell legs use Bid; protective buy legs use Ask."
+    "5% lower max loss. By default, max profit must be at least max loss and "
+    "the current stock price must be reasonably centered between the two breakevens. "
+    "Sell legs use Bid; protective buy legs use Ask."
 )
 
 if "ic_watchlist_choice" not in st.session_state:
@@ -206,8 +208,9 @@ with st.expander("Watchlist and scan settings", expanded=True):
             "Minimum max-profit / max-loss ratio",
             min_value=0.0,
             max_value=10.0,
-            value=0.05,
+            value=1.0,
             step=0.05,
+            help="1.00 means max profit must be at least as large as max loss.",
         )
 
     r2 = st.columns(4)
@@ -230,7 +233,7 @@ with st.expander("Watchlist and scan settings", expanded=True):
     with r2[3]:
         extended = st.checkbox("Use premarket / after-hours spot", value=True)
 
-    r3 = st.columns(3)
+    r3 = st.columns(4)
     with r3[0]:
         max_wing = st.number_input(
             "Maximum wing width (% of spot)",
@@ -248,6 +251,19 @@ with st.expander("Watchlist and scan settings", expanded=True):
             step=1.0,
         )
     with r3[2]:
+        min_be_balance = st.number_input(
+            "Minimum breakeven balance",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.50,
+            step=0.05,
+            help=(
+                "Smaller distance from current price to a breakeven divided by the larger distance. "
+                "0.50 means the smaller safety buffer must be at least half the larger one; "
+                "1.00 means perfectly centered."
+            ),
+        )
+    with r3[3]:
         workers = st.slider("Yahoo request concurrency", 1, 5, 3)
 
     show_debug = st.checkbox("Show diagnostics", value=True)
@@ -269,6 +285,7 @@ if run:
         max_workers=int(workers),
         min_credit_per_share=float(min_credit),
         min_profit_loss_ratio=float(min_pl),
+        min_breakeven_balance_ratio=float(min_be_balance),
         max_wing_width_pct_of_spot=float(max_wing),
         max_short_distance_pct_of_spot=float(max_short_distance),
         top_n=int(top_n),
@@ -345,6 +362,9 @@ if "ic_output" in st.session_state:
                         f"Buy Put {row['LongPutStrike']:.2f} · Sell Put {row['ShortPutStrike']:.2f} · "
                         f"Sell Call {row['ShortCallStrike']:.2f} · Buy Call {row['LongCallStrike']:.2f}\n\n"
                         f"BE {row['LowerBreakeven']:.2f}–{row['UpperBreakeven']:.2f} · "
+                        f"Spot {row['Spot']:.2f}\n\n"
+                        f"Down {row['DownsideBreakevenBuffer_pct']:.1f}% · "
+                        f"Up {row['UpsideBreakevenBuffer_pct']:.1f}% · "
                         f"Max +$" f"{row['MaxProfit']:.0f} / -$" f"{row['MaxLoss']:.0f}"
                     )
 
@@ -368,6 +388,9 @@ if "ic_output" in st.session_state:
                 "ProfitLossRatio",
                 "LowerBreakeven",
                 "UpperBreakeven",
+                "DownsideBreakevenBuffer_pct",
+                "UpsideBreakevenBuffer_pct",
+                "BreakevenBalanceRatio",
                 "BreakevenRange",
                 "BreakevenRange_pct",
                 "BreakevenRangeScore",
@@ -402,6 +425,9 @@ if "ic_output" in st.session_state:
                 "ProfitLossRatio": st.column_config.NumberColumn("Profit/loss", format="%.3f"),
                 "LowerBreakeven": st.column_config.NumberColumn("Lower BE", format="$%.2f"),
                 "UpperBreakeven": st.column_config.NumberColumn("Upper BE", format="$%.2f"),
+                "DownsideBreakevenBuffer_pct": st.column_config.NumberColumn("Downside to BE", format="%.2f%%"),
+                "UpsideBreakevenBuffer_pct": st.column_config.NumberColumn("Upside to BE", format="%.2f%%"),
+                "BreakevenBalanceRatio": st.column_config.NumberColumn("BE balance", format="%.3f"),
                 "BreakevenRange": st.column_config.NumberColumn("BE range", format="$%.2f"),
                 "BreakevenRange_pct": st.column_config.NumberColumn("BE range %", format="%.2f%%"),
                 "BreakevenRangeScore": st.column_config.NumberColumn("BE score", format="%.1f"),
@@ -419,7 +445,7 @@ if "ic_output" in st.session_state:
             "15% max-profit score + 5% low-max-loss score. Components are normalized "
             "0-100 against the valid candidates in the scan. Liquidity, executable "
             "Bid/Ask, positive credit, OTM short strikes, expiry, wing width, and the "
-            "minimum profit/loss threshold remain hard filters."
+            "minimum profit/loss threshold and minimum breakeven-balance threshold remain hard filters."
         )
 
         st.download_button(
