@@ -340,10 +340,10 @@ if "ic_output" in st.session_state:
         st.caption(
             "Interactive expiration P/L charts. Green is profit, orange is loss, "
             "the dashed blue line is the current stock price, and the shaded band "
-            "is the breakeven range. Four cards are shown per row on wide screens."
+            "is the breakeven range. Every candidate is shown, with four cards per row on wide screens."
         )
 
-        chart_rows = candidates.head(min(12, len(candidates))).to_dict("records")
+        chart_rows = candidates.to_dict("records")
         for start in range(0, len(chart_rows), 4):
             cols = st.columns(4)
             for offset, row in enumerate(chart_rows[start : start + 4]):
@@ -361,8 +361,8 @@ if "ic_output" in st.session_state:
                     st.caption(
                         f"Buy Put {row['LongPutStrike']:.2f} · Sell Put {row['ShortPutStrike']:.2f} · "
                         f"Sell Call {row['ShortCallStrike']:.2f} · Buy Call {row['LongCallStrike']:.2f}\n\n"
-                        f"BE {row['LowerBreakeven']:.2f}–{row['UpperBreakeven']:.2f} · "
-                        f"Spot {row['Spot']:.2f}\n\n"
+                        f"BE {row['LowerBreakeven']:.2f}–{row['UpperBreakeven']:.2f}\n\n"
+                        f"Current stock price: $" f"{row['Spot']:.2f}\n\n"
                         f"Down {row['DownsideBreakevenBuffer_pct']:.1f}% · "
                         f"Up {row['UpsideBreakevenBuffer_pct']:.1f}% · "
                         f"Max +$" f"{row['MaxProfit']:.0f} / -$" f"{row['MaxLoss']:.0f}"
