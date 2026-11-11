@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 import iron_condor_screener as screener
@@ -41,10 +43,107 @@ def add_robinhood_column(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def payoff_chart(row: dict) -> go.Figure:
+    long_put = float(row["LongPutStrike"])
+    short_put = float(row["ShortPutStrike"])
+    short_call = float(row["ShortCallStrike"])
+    long_call = float(row["LongCallStrike"])
+    credit = float(row["NetCredit_perShare"])
+    spot = float(row["Spot"])
+    lower_be = float(row["LowerBreakeven"])
+    upper_be = float(row["UpperBreakeven"])
+
+    structure_width = max(long_call - long_put, 1.0)
+    margin = max(structure_width * 0.18, spot * 0.03, 1.0)
+    prices = np.linspace(max(0.01, long_put - margin), long_call + margin, 181)
+
+    payoff_per_share = (
+        credit
+        + np.maximum(long_put - prices, 0.0)
+        - np.maximum(short_put - prices, 0.0)
+        - np.maximum(prices - short_call, 0.0)
+        + np.maximum(prices - long_call, 0.0)
+    )
+    payoff = payoff_per_share * 100.0
+
+    positive = np.where(payoff >= 0.0, payoff, np.nan)
+    negative = np.where(payoff < 0.0, payoff, np.nan)
+
+    fig = go.Figure()
+    fig.add_vrect(
+        x0=lower_be,
+        x1=upper_be,
+        fillcolor="rgba(0, 180, 80, 0.10)",
+        line_width=0,
+        layer="below",
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=prices,
+            y=positive,
+            mode="lines",
+            line=dict(width=3, color="#16a34a"),
+            fill="tozeroy",
+            fillcolor="rgba(22, 163, 74, 0.16)",
+            hovertemplate="Stock $%{x:.2f}<br>P/L $%{y:.0f}<extra></extra>",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=prices,
+            y=negative,
+            mode="lines",
+            line=dict(width=3, color="#f97316"),
+            fill="tozeroy",
+            fillcolor="rgba(249, 115, 22, 0.14)",
+            hovertemplate="Stock $%{x:.2f}<br>P/L $%{y:.0f}<extra></extra>",
+            showlegend=False,
+        )
+    )
+    fig.add_hline(y=0, line_width=1, line_color="rgba(140,140,140,0.8)")
+    fig.add_vline(
+        x=spot,
+        line_width=1.5,
+        line_dash="dash",
+        line_color="rgba(80,120,255,0.9)",
+    )
+    fig.add_vline(
+        x=lower_be,
+        line_width=1,
+        line_dash="dot",
+        line_color="rgba(140,140,140,0.7)",
+    )
+    fig.add_vline(
+        x=upper_be,
+        line_width=1,
+        line_dash="dot",
+        line_color="rgba(140,140,140,0.7)",
+    )
+    fig.update_layout(
+        height=245,
+        margin=dict(l=8, r=8, t=6, b=8),
+        xaxis_title=None,
+        yaxis_title=None,
+        hovermode="x",
+        showlegend=False,
+    )
+    fig.update_xaxes(showgrid=False, tickfont=dict(size=10), fixedrange=False)
+    fig.update_yaxes(
+        zeroline=False,
+        gridcolor="rgba(128,128,128,0.12)",
+        tickprefix="$",
+        tickfont=dict(size=10),
+        fixedrange=False,
+    )
+    return fig
+
+
 st.title("Iron Condor Screener")
 st.caption(
-    "Ranks candidates by widest expiration profit zone first, then highest "
-    "max-profit/max-loss ratio. Short legs use Bid and protective long legs use Ask."
+    "Ranks valid iron condors with a 0-100 score: 45% wider breakeven range, "
+    "35% higher max-profit/max-loss ratio, 15% higher max profit, and "
+    "5% lower max loss. Short legs use Bid; protective long legs use Ask."
 )
 
 if "ic_watchlist_choice" not in st.session_state:
@@ -220,9 +319,39 @@ if "ic_output" in st.session_state:
     if candidates.empty:
         st.info("No iron-condor combinations passed every active filter.")
     else:
+        st.subheader("Top payoff profiles")
+        st.caption(
+            "Interactive expiration P/L charts. Green is profit, orange is loss, "
+            "the dashed blue line is the current stock price, and the shaded band "
+            "is the breakeven range. Four cards are shown per row on wide screens."
+        )
+
+        chart_rows = candidates.head(min(12, len(candidates))).to_dict("records")
+        for start in range(0, len(chart_rows), 4):
+            cols = st.columns(4)
+            for offset, row in enumerate(chart_rows[start : start + 4]):
+                rank = start + offset + 1
+                with cols[offset]:
+                    st.markdown(
+                        f"**#{rank} {row['Ticker']} · Score {float(row['OverallScore']):.1f}/100**"
+                    )
+                    st.plotly_chart(
+                        payoff_chart(row),
+                        use_container_width=True,
+                        config={"displayModeBar": False, "scrollZoom": False},
+                        key=f"ic_payoff_{rank}_{row['Ticker']}",
+                    )
+                    st.caption(
+                        f"LP {row['LongPutStrike']:.2f} · SP {row['ShortPutStrike']:.2f} · "
+                        f"SC {row['ShortCallStrike']:.2f} · LC {row['LongCallStrike']:.2f}\n\n"
+                        f"BE {row['LowerBreakeven']:.2f}–{row['UpperBreakeven']:.2f} · "
+                        f"Max +$" f"{row['MaxProfit']:.0f} / -$" f"{row['MaxLoss']:.0f}"
+                    )
+
         display = add_robinhood_column(candidates)
         visible = display.reindex(
             columns=[
+                "OverallScore",
                 "Ticker",
                 "Spot",
                 "RobinhoodChain",
@@ -239,8 +368,12 @@ if "ic_output" in st.session_state:
                 "ProfitLossRatio",
                 "LowerBreakeven",
                 "UpperBreakeven",
-                "ProfitZoneWidth",
-                "ProfitZoneWidth_pct",
+                "BreakevenRange",
+                "BreakevenRange_pct",
+                "BreakevenRangeScore",
+                "ProfitLossScore",
+                "MaxProfitScore",
+                "LowMaxLossScore",
                 "NearestShortDistance_pct",
                 "PutWingWidth",
                 "CallWingWidth",
@@ -254,6 +387,7 @@ if "ic_output" in st.session_state:
             use_container_width=True,
             hide_index=True,
             column_config={
+                "OverallScore": st.column_config.NumberColumn("Score", format="%.1f", pinned=True, width="small"),
                 "Ticker": st.column_config.TextColumn("Ticker", pinned=True, width="small"),
                 "Spot": st.column_config.NumberColumn("Spot", format="$%.2f", pinned=True, width="small"),
                 "RobinhoodChain": st.column_config.LinkColumn("Robinhood", display_text="Open chain"),
@@ -268,8 +402,12 @@ if "ic_output" in st.session_state:
                 "ProfitLossRatio": st.column_config.NumberColumn("Profit/loss", format="%.3f"),
                 "LowerBreakeven": st.column_config.NumberColumn("Lower BE", format="$%.2f"),
                 "UpperBreakeven": st.column_config.NumberColumn("Upper BE", format="$%.2f"),
-                "ProfitZoneWidth": st.column_config.NumberColumn("Profit-zone width", format="$%.2f"),
-                "ProfitZoneWidth_pct": st.column_config.NumberColumn("Profit-zone width %", format="%.2f%%"),
+                "BreakevenRange": st.column_config.NumberColumn("BE range", format="$%.2f"),
+                "BreakevenRange_pct": st.column_config.NumberColumn("BE range %", format="%.2f%%"),
+                "BreakevenRangeScore": st.column_config.NumberColumn("BE score", format="%.1f"),
+                "ProfitLossScore": st.column_config.NumberColumn("P/L score", format="%.1f"),
+                "MaxProfitScore": st.column_config.NumberColumn("Profit score", format="%.1f"),
+                "LowMaxLossScore": st.column_config.NumberColumn("Loss score", format="%.1f"),
                 "NearestShortDistance_pct": st.column_config.NumberColumn("Nearest short distance", format="%.2f%%"),
                 "PutWingWidth": st.column_config.NumberColumn("Put wing", format="$%.2f"),
                 "CallWingWidth": st.column_config.NumberColumn("Call wing", format="$%.2f"),
@@ -277,9 +415,11 @@ if "ic_output" in st.session_state:
         )
 
         st.caption(
-            "Ranking: widest expiration profit zone first, then highest max-profit/max-loss ratio, "
-            "then higher executable net credit. Max profit equals net credit; max loss is the wider "
-            "wing minus the net credit."
+            "Overall score = 45% breakeven-range score + 35% profit/loss score + "
+            "15% max-profit score + 5% low-max-loss score. Components are normalized "
+            "0-100 against the valid candidates in the scan. Liquidity, executable "
+            "Bid/Ask, positive credit, OTM short strikes, expiry, wing width, and the "
+            "minimum profit/loss threshold remain hard filters."
         )
 
         st.download_button(
