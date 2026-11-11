@@ -29,7 +29,8 @@ class IronCondorConfig:
     retries: int = 2
     retry_delay_seconds: float = 0.8
     min_credit_per_share: float = 0.05
-    min_profit_loss_ratio: float = 0.05
+    min_profit_loss_ratio: float = 1.0
+    min_breakeven_balance_ratio: float = 0.50
     max_wing_width_pct_of_spot: float = 15.0
     max_short_distance_pct_of_spot: float = 35.0
     top_n: int = 25
@@ -450,8 +451,27 @@ def select_iron_condor(
 
                     lower_be = short_put_strike - net_credit
                     upper_be = short_call_strike + net_credit
+
+                    # Keep the current stock price safely inside the breakeven band,
+                    # and reject highly lopsided ranges where spot sits near one edge.
+                    downside_buffer = spot - lower_be
+                    upside_buffer = upper_be - spot
+                    if downside_buffer <= 0 or upside_buffer <= 0:
+                        continue
+
+                    larger_buffer = max(downside_buffer, upside_buffer)
+                    breakeven_balance_ratio = (
+                        min(downside_buffer, upside_buffer) / larger_buffer
+                        if larger_buffer > 0
+                        else 0.0
+                    )
+                    if breakeven_balance_ratio < config.min_breakeven_balance_ratio:
+                        continue
+
                     profit_zone = upper_be - lower_be
                     profit_zone_pct = profit_zone / spot * 100.0
+                    downside_buffer_pct = downside_buffer / spot * 100.0
+                    upside_buffer_pct = upside_buffer / spot * 100.0
 
                     nearest_short_distance_pct = min(
                         (spot - short_put_strike) / spot * 100.0,
@@ -493,6 +513,11 @@ def select_iron_condor(
                         "ProfitLossRatio": round_or_nan(profit_loss_ratio, 3),
                         "LowerBreakeven": round_or_nan(lower_be),
                         "UpperBreakeven": round_or_nan(upper_be),
+                        "DownsideBreakevenBuffer": round_or_nan(downside_buffer),
+                        "UpsideBreakevenBuffer": round_or_nan(upside_buffer),
+                        "DownsideBreakevenBuffer_pct": round_or_nan(downside_buffer_pct),
+                        "UpsideBreakevenBuffer_pct": round_or_nan(upside_buffer_pct),
+                        "BreakevenBalanceRatio": round_or_nan(breakeven_balance_ratio, 3),
                         "BreakevenRange": round_or_nan(profit_zone),
                         "BreakevenRange_pct": round_or_nan(profit_zone_pct),
                         # Backward-compatible aliases used by older exports/UI.
@@ -507,7 +532,7 @@ def select_iron_condor(
                     valid_candidates.append(candidate)
 
     if not valid_candidates:
-        return None, "No positive-credit iron condor met the wing-width and profit/loss filters after short-leg liquidity screening"
+        return None, "No iron condor met credit, profit/loss, wing-width, and centered-breakeven filters after short-leg liquidity screening"
 
     # Pick the best structure for this ticker using the same score philosophy
     # used for global ranking. The scores are recomputed globally after all
@@ -518,6 +543,7 @@ def select_iron_condor(
         key=lambda row: (
             safe_float(row.get("OverallScore")),
             safe_float(row.get("BreakevenRange_pct")),
+            safe_float(row.get("BreakevenBalanceRatio")),
             safe_float(row.get("ProfitLossRatio")),
             safe_float(row.get("MaxProfit")),
             -safe_float(row.get("MaxLoss")),
@@ -652,6 +678,7 @@ def scan_iron_condors(
         key=lambda row: (
             -safe_float(row.get("OverallScore")),
             -safe_float(row.get("BreakevenRange_pct")),
+            -safe_float(row.get("BreakevenBalanceRatio")),
             -safe_float(row.get("ProfitLossRatio")),
             -safe_float(row.get("MaxProfit")),
             safe_float(row.get("MaxLoss")),
