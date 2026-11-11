@@ -143,7 +143,7 @@ st.title("Iron Condor Screener")
 st.caption(
     "Ranks valid iron condors with a 0-100 score: 45% wider breakeven range, "
     "35% higher max-profit/max-loss ratio, 15% higher max profit, and "
-    "5% lower max loss. Short legs use Bid; protective long legs use Ask."
+    "5% lower max loss. Sell legs use Bid; protective buy legs use Ask."
 )
 
 if "ic_watchlist_choice" not in st.session_state:
@@ -342,8 +342,8 @@ if "ic_output" in st.session_state:
                         key=f"ic_payoff_{rank}_{row['Ticker']}",
                     )
                     st.caption(
-                        f"LP {row['LongPutStrike']:.2f} · SP {row['ShortPutStrike']:.2f} · "
-                        f"SC {row['ShortCallStrike']:.2f} · LC {row['LongCallStrike']:.2f}\n\n"
+                        f"Buy Put {row['LongPutStrike']:.2f} · Sell Put {row['ShortPutStrike']:.2f} · "
+                        f"Sell Call {row['ShortCallStrike']:.2f} · Buy Call {row['LongCallStrike']:.2f}\n\n"
                         f"BE {row['LowerBreakeven']:.2f}–{row['UpperBreakeven']:.2f} · "
                         f"Max +$" f"{row['MaxProfit']:.0f} / -$" f"{row['MaxLoss']:.0f}"
                     )
@@ -392,10 +392,10 @@ if "ic_output" in st.session_state:
                 "Spot": st.column_config.NumberColumn("Spot", format="$%.2f", pinned=True, width="small"),
                 "RobinhoodChain": st.column_config.LinkColumn("Robinhood", display_text="Open chain"),
                 "UnderlyingDayChange_pct": st.column_config.NumberColumn("Day move", format="%.2f%%"),
-                "LongPutStrike": st.column_config.NumberColumn("Long put", format="$%.2f"),
-                "ShortPutStrike": st.column_config.NumberColumn("Short put", format="$%.2f"),
-                "ShortCallStrike": st.column_config.NumberColumn("Short call", format="$%.2f"),
-                "LongCallStrike": st.column_config.NumberColumn("Long call", format="$%.2f"),
+                "LongPutStrike": st.column_config.NumberColumn("Buy put", format="$%.2f"),
+                "ShortPutStrike": st.column_config.NumberColumn("Sell put", format="$%.2f"),
+                "ShortCallStrike": st.column_config.NumberColumn("Sell call", format="$%.2f"),
+                "LongCallStrike": st.column_config.NumberColumn("Buy call", format="$%.2f"),
                 "NetCredit_perCondor": st.column_config.NumberColumn("Net credit", format="$%.0f"),
                 "MaxProfit": st.column_config.NumberColumn("Max profit", format="$%.0f"),
                 "MaxLoss": st.column_config.NumberColumn("Max loss", format="$%.0f"),
