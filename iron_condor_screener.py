@@ -64,6 +64,78 @@ def round_or_nan(value: float, digits: int = 2) -> float:
     return round(float(value), digits) if math.isfinite(value) else math.nan
 
 
+SCORE_WEIGHTS = {
+    "breakeven_range": 0.45,
+    "profit_loss": 0.35,
+    "max_profit": 0.15,
+    "low_max_loss": 0.05,
+}
+
+
+def _normalise_component(values: list[float], higher_is_better: bool = True) -> list[float]:
+    finite = [value for value in values if math.isfinite(value)]
+    if not finite:
+        return [0.0 for _ in values]
+
+    low = min(finite)
+    high = max(finite)
+    if math.isclose(low, high):
+        return [100.0 if math.isfinite(value) else 0.0 for value in values]
+
+    scores: list[float] = []
+    for value in values:
+        if not math.isfinite(value):
+            scores.append(0.0)
+            continue
+        scaled = (value - low) / (high - low)
+        if not higher_is_better:
+            scaled = 1.0 - scaled
+        scores.append(scaled * 100.0)
+    return scores
+
+
+def score_candidates(rows: list[dict]) -> list[dict]:
+    """Return copies of candidate rows with 0-100 component and overall scores."""
+    if not rows:
+        return []
+
+    scored = [dict(row) for row in rows]
+    breakeven_scores = _normalise_component(
+        [safe_float(row.get("BreakevenRange_pct", row.get("ProfitZoneWidth_pct"))) for row in scored]
+    )
+    profit_loss_scores = _normalise_component(
+        [safe_float(row.get("ProfitLossRatio")) for row in scored]
+    )
+    max_profit_scores = _normalise_component(
+        [safe_float(row.get("MaxProfit")) for row in scored]
+    )
+    low_max_loss_scores = _normalise_component(
+        [safe_float(row.get("MaxLoss")) for row in scored],
+        higher_is_better=False,
+    )
+
+    for row, be_score, pl_score, profit_score, loss_score in zip(
+        scored,
+        breakeven_scores,
+        profit_loss_scores,
+        max_profit_scores,
+        low_max_loss_scores,
+    ):
+        overall = (
+            SCORE_WEIGHTS["breakeven_range"] * be_score
+            + SCORE_WEIGHTS["profit_loss"] * pl_score
+            + SCORE_WEIGHTS["max_profit"] * profit_score
+            + SCORE_WEIGHTS["low_max_loss"] * loss_score
+        )
+        row["BreakevenRangeScore"] = round_or_nan(be_score, 1)
+        row["ProfitLossScore"] = round_or_nan(pl_score, 1)
+        row["MaxProfitScore"] = round_or_nan(profit_score, 1)
+        row["LowMaxLossScore"] = round_or_nan(loss_score, 1)
+        row["OverallScore"] = round_or_nan(overall, 1)
+
+    return scored
+
+
 def parse_tickers(text: str) -> list[str]:
     tickers: list[str] = []
     seen: set[str] = set()
@@ -319,8 +391,7 @@ def select_iron_condor(
     if short_puts.empty or short_calls.empty:
         return None, "No OTM short put/call legs passed short-leg bid, OI, volume, and spread filters"
 
-    best: dict | None = None
-    best_key: tuple | None = None
+    valid_candidates: list[dict] = []
 
     for _, sp in short_puts.iterrows():
         short_put_strike = safe_float(sp["strike"])
@@ -394,63 +465,67 @@ def select_iron_condor(
                         safe_int(x["volume"]) for x in (lp, sp, sc, lc)
                     )
 
-                    # User preference:
-                    # 1) widest profitable range
-                    # 2) highest max-profit/max-loss ratio
-                    # 3) higher executable credit
-                    key = (
-                        profit_zone_pct,
-                        profit_loss_ratio,
-                        net_credit,
-                        nearest_short_distance_pct,
-                        total_oi,
-                        total_volume,
-                    )
+                    candidate = {
+                        "Ticker": ticker,
+                        "Spot": round_or_nan(spot),
+                        "SpotSource": spot_source,
+                        "SpotTimestamp": spot_timestamp or "",
+                        "UnderlyingDayChange_pct": round_or_nan(
+                            underlying_day_change_pct
+                        ),
+                        "Expiry": expiry,
+                        "ExpirySelection": expiry_note,
+                        "DaysToExpiry": dte,
+                        "LongPutStrike": round_or_nan(long_put_strike),
+                        "ShortPutStrike": round_or_nan(short_put_strike),
+                        "ShortCallStrike": round_or_nan(short_call_strike),
+                        "LongCallStrike": round_or_nan(long_call_strike),
+                        "LongPutAsk": round_or_nan(safe_float(lp["ask"])),
+                        "ShortPutBid": round_or_nan(safe_float(sp["bid"])),
+                        "ShortCallBid": round_or_nan(safe_float(sc["bid"])),
+                        "LongCallAsk": round_or_nan(safe_float(lc["ask"])),
+                        "PutWingWidth": round_or_nan(put_width),
+                        "CallWingWidth": round_or_nan(call_width),
+                        "NetCredit_perShare": round_or_nan(net_credit),
+                        "NetCredit_perCondor": round_or_nan(net_credit * 100.0),
+                        "MaxProfit": round_or_nan(max_profit),
+                        "MaxLoss": round_or_nan(max_loss),
+                        "ProfitLossRatio": round_or_nan(profit_loss_ratio, 3),
+                        "LowerBreakeven": round_or_nan(lower_be),
+                        "UpperBreakeven": round_or_nan(upper_be),
+                        "BreakevenRange": round_or_nan(profit_zone),
+                        "BreakevenRange_pct": round_or_nan(profit_zone_pct),
+                        # Backward-compatible aliases used by older exports/UI.
+                        "ProfitZoneWidth": round_or_nan(profit_zone),
+                        "ProfitZoneWidth_pct": round_or_nan(profit_zone_pct),
+                        "NearestShortDistance_pct": round_or_nan(
+                            nearest_short_distance_pct
+                        ),
+                        "TotalOpenInterest": total_oi,
+                        "TotalOptionVolume": total_volume,
+                    }
+                    valid_candidates.append(candidate)
 
-                    if best_key is None or key > best_key:
-                        best_key = key
-                        best = {
-                            "Ticker": ticker,
-                            "Spot": round_or_nan(spot),
-                            "SpotSource": spot_source,
-                            "SpotTimestamp": spot_timestamp or "",
-                            "UnderlyingDayChange_pct": round_or_nan(
-                                underlying_day_change_pct
-                            ),
-                            "Expiry": expiry,
-                            "ExpirySelection": expiry_note,
-                            "DaysToExpiry": dte,
-                            "LongPutStrike": round_or_nan(long_put_strike),
-                            "ShortPutStrike": round_or_nan(short_put_strike),
-                            "ShortCallStrike": round_or_nan(short_call_strike),
-                            "LongCallStrike": round_or_nan(long_call_strike),
-                            "LongPutAsk": round_or_nan(safe_float(lp["ask"])),
-                            "ShortPutBid": round_or_nan(safe_float(sp["bid"])),
-                            "ShortCallBid": round_or_nan(safe_float(sc["bid"])),
-                            "LongCallAsk": round_or_nan(safe_float(lc["ask"])),
-                            "PutWingWidth": round_or_nan(put_width),
-                            "CallWingWidth": round_or_nan(call_width),
-                            "NetCredit_perShare": round_or_nan(net_credit),
-                            "NetCredit_perCondor": round_or_nan(net_credit * 100.0),
-                            "MaxProfit": round_or_nan(max_profit),
-                            "MaxLoss": round_or_nan(max_loss),
-                            "ProfitLossRatio": round_or_nan(profit_loss_ratio, 3),
-                            "LowerBreakeven": round_or_nan(lower_be),
-                            "UpperBreakeven": round_or_nan(upper_be),
-                            "ProfitZoneWidth": round_or_nan(profit_zone),
-                            "ProfitZoneWidth_pct": round_or_nan(profit_zone_pct),
-                            "NearestShortDistance_pct": round_or_nan(
-                                nearest_short_distance_pct
-                            ),
-                            "TotalOpenInterest": total_oi,
-                            "TotalOptionVolume": total_volume,
-                        }
-
-    if best is None:
+    if not valid_candidates:
         return None, "No positive-credit iron condor met the wing-width and profit/loss filters after short-leg liquidity screening"
 
+    # Pick the best structure for this ticker using the same score philosophy
+    # used for global ranking. The scores are recomputed globally after all
+    # tickers finish so the displayed 0-100 values are comparable across stocks.
+    ticker_scored = score_candidates(valid_candidates)
+    best = max(
+        ticker_scored,
+        key=lambda row: (
+            safe_float(row.get("OverallScore")),
+            safe_float(row.get("BreakevenRange_pct")),
+            safe_float(row.get("ProfitLossRatio")),
+            safe_float(row.get("MaxProfit")),
+            -safe_float(row.get("MaxLoss")),
+        ),
+    )
     return best, (
-        "Selected widest profit zone, then highest max-profit/max-loss ratio"
+        "Selected by weighted score: 45% breakeven range, 35% profit/loss, "
+        "15% max profit, 5% lower max loss"
     )
 
 
@@ -572,12 +647,14 @@ def scan_iron_condors(
                     diagnostic["Result"],
                 )
 
+    candidates = score_candidates(candidates)
     candidates.sort(
         key=lambda row: (
-            -safe_float(row.get("ProfitZoneWidth_pct")),
+            -safe_float(row.get("OverallScore")),
+            -safe_float(row.get("BreakevenRange_pct")),
             -safe_float(row.get("ProfitLossRatio")),
-            -safe_float(row.get("NetCredit_perShare")),
-            -safe_float(row.get("NearestShortDistance_pct")),
+            -safe_float(row.get("MaxProfit")),
+            safe_float(row.get("MaxLoss")),
             -safe_float(row.get("TotalOpenInterest")),
         )
     )
